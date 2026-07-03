@@ -59,6 +59,9 @@ enum Command {
         sub: AnalyzeCommand,
     },
 
+    /// Show offline database statistics
+    Stats,
+
     /// Export the graph to a JSON file
     Export { file: String },
 }
@@ -458,6 +461,47 @@ fn print_degree_dist(dist: &[DegreeDist], json: bool) {
     }
 }
 
+fn print_stats(
+    total: u64,
+    crawled: u64,
+    pending: u64,
+    min_deg: i32,
+    max_deg: i32,
+    file_size: u64,
+    dist: &[DegreeDist],
+) {
+    let size_str = if file_size > 1_000_000 {
+        format!("{:.1} MB", file_size as f64 / 1_000_000.0)
+    } else {
+        format!("{} KB", file_size / 1000)
+    };
+
+    println!("{}", "📊 gh6 数据库概况".bold());
+    println!("{}", "────────────────".dimmed());
+    println!("  用户总数    {}", fmt_thousands(total));
+    println!(
+        "  已爬 / 排队 {}/ {}",
+        fmt_thousands(crawled),
+        fmt_thousands(pending)
+    );
+    println!("  度数范围    {min_deg}° ~ {max_deg}°");
+    println!("  数据库      {size_str}");
+    println!();
+    println!("{}", "度数分布".bold());
+    println!("{}", "────────".dimmed());
+    let max_count = dist.iter().map(|d| d.count).max().unwrap_or(1) as u64;
+    for d in dist {
+        let b = bar(d.count as u64, max_count, 30);
+        let cnt = fmt_thousands(d.count as u64);
+        println!(
+            "  {:>3}°  {:>6}  {}",
+            d.degree.to_string().cyan(),
+            cnt,
+            b.dimmed()
+        );
+    }
+}
+
 fn print_export(users: usize, edges: usize, file: &str, json: bool) {
     if json {
         println!(
@@ -558,6 +602,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let dist = analyze::cmd_degree_dist(&db)?;
                     print_degree_dist(&dist, cli.json);
                 }
+            }
+        }
+
+        Command::Stats => {
+            let db = Db::open()?;
+            let total_users = db.get_user_count()? as u64;
+            let crawled = db.get_crawled_count("follow_crawler")? as u64;
+            let pending = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
+            let dist = db.degree_distribution()?;
+            let min_degree = dist.first().map(|d| d.degree).unwrap_or(0);
+            let max_degree = dist.last().map(|d| d.degree).unwrap_or(0);
+
+            let home = std::env::var("HOME").unwrap_or_default();
+            let db_path = PathBuf::from(home).join(".local/share/gh6/gh6.db");
+            let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "total_users": total_users,
+                        "crawled": crawled,
+                        "pending": pending,
+                        "min_degree": min_degree,
+                        "max_degree": max_degree,
+                        "file_size_bytes": file_size
+                    })
+                );
+            } else {
+                print_stats(
+                    total_users,
+                    crawled,
+                    pending,
+                    min_degree,
+                    max_degree,
+                    file_size,
+                    &dist,
+                );
             }
         }
 
