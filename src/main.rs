@@ -205,6 +205,9 @@ fn format_uptime(secs: u64) -> String {
 
 /// Convert a Unix timestamp (seconds) to a UTC datetime string.
 fn format_utc(ts: i64) -> String {
+    if ts == 0 {
+        return "(unknown)".to_string();
+    }
     let (y, mo, d, h, mi, s) = unix_to_utc(ts);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }

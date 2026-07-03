@@ -2,7 +2,7 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::Db;
-use crate::github::GithubClient;
+use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlResult, GithubUser, NewEdge};
 
 // ── Error type ────────────────────────────────────────────────────────────────

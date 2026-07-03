@@ -1,43 +1,59 @@
 use crate::types::{GithubUser, RateLimit};
-use reqwest::header::{HeaderMap, ACCEPT, LINK};
-use reqwest::Client;
 use serde::Deserialize;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Error, Debug)]
 pub enum GithubError {
-    #[error("HTTP request failed: {0}")]
-    Reqwest(#[from] reqwest::Error),
+    #[error("gh command failed: {0}")]
+    Command(String),
 
-    #[error(
-        "No GitHub token found. Set GITHUB_TOKEN env var or run `gh auth login`"
-    )]
+    #[error("no GitHub token found; run `gh auth login`")]
     NoToken,
 
-    #[error("GitHub API error: {0}")]
-    Api(String),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
 
-    #[error("Rate limit exceeded. Resets at unix timestamp {0}")]
+    #[error("rate limit exceeded; resets at unix timestamp {0}")]
     RateLimitExceeded(i64),
 }
 
 // ---------------------------------------------------------------------------
-// Internal deserialization helper (GitHub API uses camelCase)
+// Abstraction trait (swap impls later — GhClient vs ReqwestClient)
+// ---------------------------------------------------------------------------
+
+/// Abstraction over GitHub API access. Currently implemented by [`GhClient`].
+pub trait GithubApi: Send + Sync {
+    async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError>;
+    async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError>;
+    fn rate_limit(&self) -> RateLimit;
+}
+
+// ---------------------------------------------------------------------------
+// Deserialization helpers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct GithubApiUser {
+struct GhRateLimit {
+    remaining: u32,
+    reset: i64,
+}
+
+/// Minimal user returned by `/users/{login}/following` (summary object).
+/// All fields except `login` and `avatar_url` are `#[serde(default)]` because
+/// the following endpoint omits many fields present in the full user response.
+#[derive(Debug, Deserialize)]
+struct GhUser {
     login: String,
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     avatar_url: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     company: Option<String>,
     #[serde(default)]
@@ -54,8 +70,8 @@ struct GithubApiUser {
     updated_at: Option<String>,
 }
 
-impl From<GithubApiUser> for GithubUser {
-    fn from(u: GithubApiUser) -> Self {
+impl From<GhUser> for GithubUser {
+    fn from(u: GhUser) -> Self {
         GithubUser {
             login: u.login,
             name: u.name,
@@ -72,366 +88,107 @@ impl From<GithubApiUser> for GithubUser {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub API client
+// GhClient – implementation via `gh api`
 // ---------------------------------------------------------------------------
 
-pub struct GithubClient {
-    client: Client,
-    token: String,
+pub type GithubClient = GhClient;
+
+pub struct GhClient {
     rate_limit: Arc<Mutex<RateLimit>>,
 }
 
-impl GithubClient {
-    /// Create a new GitHub API client.
-    ///
-    /// Reads the token from the `GITHUB_TOKEN` environment variable. If that is
-    /// not set, falls back to running `gh auth token`.
+impl GhClient {
     pub async fn new() -> Result<Self, GithubError> {
-        let token = resolve_token()?;
+        // Verify gh is available and authenticated
+        let output = Command::new("gh")
+            .args(["auth", "status"])
+            .output()
+            .map_err(|_| GithubError::NoToken)?;
+        if !output.status.success() {
+            return Err(GithubError::NoToken);
+        }
 
-        let client = Client::builder()
-            .user_agent("gh6")
-            .build()
-            .map_err(GithubError::Reqwest)?;
-
-        Ok(GithubClient {
-            client,
-            token,
+        Ok(Self {
             rate_limit: Arc::new(Mutex::new(RateLimit {
-                remaining: 5000, // optimistic default; overwritten on first call
+                remaining: 5000, // optimistic; refreshed on first call
                 reset_at: 0,
             })),
         })
     }
 
-    // ------------------------------------------------------------------
-    // Public API
-    // ------------------------------------------------------------------
+    /// Run `gh api` with the given arguments, return stdout as string.
+    async fn gh(&self, args: &[&str]) -> Result<String, GithubError> {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let args_display = args_owned.join(" ");
 
-    /// Fetch a single GitHub user by login.
-    ///
-    /// `GET https://api.github.com/users/{login}`
-    pub async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError> {
-        self.check_rate_limit()?;
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new("gh")
+                .arg("api")
+                .args(&args_owned)
+                .output()
+        })
+        .await
+        .map_err(|e| GithubError::Command(format!("spawn_blocking failed: {e}")))?;
 
-        let url = format!("https://api.github.com/users/{login}");
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
+        let output =
+            output.map_err(|e| GithubError::Command(format!("gh api: {e}")))?;
 
-        self.update_rate_limit(response.headers());
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GithubError::Api(format!(
-                "GET {url}: {status} – {body}"
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GithubError::Command(format!(
+                "gh api {args_display}: {}",
+                stderr.trim()
             )));
         }
 
-        let api_user: GithubApiUser = response.json().await?;
-        Ok(GithubUser::from(api_user))
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// Fetch the list of users that `login` follows.
-    ///
-    /// `GET https://api.github.com/users/{login}/following?per_page=100`
-    ///
-    /// Automatically follows pagination via the `Link` header until all pages
-    /// have been consumed.
-    pub async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError> {
-        let mut all_users: Vec<GithubUser> = Vec::new();
-        let mut url = format!("https://api.github.com/users/{login}/following?per_page=100");
-
-        loop {
-            self.check_rate_limit()?;
-
-            let response = self
-                .client
-                .get(&url)
-                .bearer_auth(&self.token)
-                .header(ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send()
-                .await?;
-
-            self.update_rate_limit(response.headers());
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(GithubError::Api(format!(
-                    "GET {url}: {status} – {body}"
-                )));
-            }
-
-            // Snapshot headers *before* consuming the body so we can inspect
-            // the `Link` header for pagination.
-            let headers = response.headers().clone();
-            let page_users: Vec<GithubApiUser> = response.json().await?;
-            all_users.extend(page_users.into_iter().map(GithubUser::from));
-
-            match parse_next_link(&headers) {
-                Some(next_url) => url = next_url,
-                None => break,
+    /// Refresh cached rate-limit info from `/rate_limit`.
+    async fn refresh_rate_limit(&self) {
+        // Best-effort — don't fail the whole operation if this fails.
+        if let Ok(json) = self.gh(&["/rate_limit", "--jq", ".rate"]).await {
+            if let Ok(rl) = serde_json::from_str::<GhRateLimit>(&json) {
+                if let Ok(mut guard) = self.rate_limit.lock() {
+                    guard.remaining = rl.remaining;
+                    guard.reset_at = rl.reset;
+                }
             }
         }
+    }
+}
 
-        Ok(all_users)
+impl GithubApi for GhClient {
+    async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError> {
+        let json = self.gh(&[&format!("/users/{login}")]).await?;
+        let gh_user: GhUser = serde_json::from_str(&json)?;
+        self.refresh_rate_limit().await;
+        Ok(GithubUser::from(gh_user))
     }
 
-    /// Return a snapshot of the current rate-limit state.
-    pub fn rate_limit(&self) -> RateLimit {
+    async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError> {
+        let output = self
+            .gh(&[&format!("/users/{login}/following"), "--paginate"])
+            .await?;
+
+        let mut users = Vec::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let page: Vec<GhUser> = serde_json::from_str(line)?;
+            users.extend(page.into_iter().map(GithubUser::from));
+        }
+
+        self.refresh_rate_limit().await;
+        Ok(users)
+    }
+
+    fn rate_limit(&self) -> RateLimit {
         self.rate_limit
             .lock()
             .expect("rate-limit mutex poisoned")
             .clone()
-    }
-
-    // ------------------------------------------------------------------
-    // Private helpers
-    // ------------------------------------------------------------------
-
-    /// Check whether we are rate-limited right now.  Returns
-    /// `Err(GithubError::RateLimitExceeded)` when `remaining == 0` and the
-    /// reset window has not yet passed.
-    fn check_rate_limit(&self) -> Result<(), GithubError> {
-        let rl = self
-            .rate_limit
-            .lock()
-            .expect("rate-limit mutex poisoned");
-
-        if rl.remaining == 0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            if now < rl.reset_at {
-                return Err(GithubError::RateLimitExceeded(rl.reset_at));
-            }
-        }
-        Ok(())
-    }
-
-    /// Parse `x-ratelimit-remaining` and `x-ratelimit-reset` from response
-    /// headers and update the shared rate-limit tracking state.
-    fn update_rate_limit(&self, headers: &HeaderMap) {
-        let mut rl = self
-            .rate_limit
-            .lock()
-            .expect("rate-limit mutex poisoned");
-
-        if let Some(val) = headers.get("x-ratelimit-remaining") {
-            if let Ok(v) = val.to_str().unwrap_or("0").parse::<u32>() {
-                rl.remaining = v;
-            }
-        }
-
-        if let Some(val) = headers.get("x-ratelimit-reset") {
-            if let Ok(v) = val.to_str().unwrap_or("0").parse::<i64>() {
-                rl.reset_at = v;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Free functions
-// ---------------------------------------------------------------------------
-
-/// Resolve a GitHub personal access token, trying `GITHUB_TOKEN` first, then
-/// falling back to the `gh` CLI.
-fn resolve_token() -> Result<String, GithubError> {
-    // 1. Environment variable
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    // 2. `gh auth token`
-    let output = Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .map_err(|_| GithubError::NoToken)?;
-
-    if output.status.success() {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    Err(GithubError::NoToken)
-}
-
-/// Parse the `Link` header from a GitHub API response to find the URL for the
-/// next page (`rel="next"`).
-///
-/// Example header value:
-/// `<https://api.github.com/user/123/following?page=2>; rel="next",
-///  <https://api.github.com/user/123/following?page=10>; rel="last"`
-fn parse_next_link(headers: &HeaderMap) -> Option<String> {
-    let link_header = headers.get(LINK)?.to_str().ok()?;
-
-    for part in link_header.split(',') {
-        if part.contains(r#"rel="next""#) {
-            let start = part.find('<')?;
-            let end = part.find('>')?;
-            return Some(part[start + 1..end].to_string());
-        }
-    }
-
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---------------------------------------------------------------
-    // parse_next_link
-    // ---------------------------------------------------------------
-
-    fn header_map_with_link(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(LINK, value.parse().unwrap());
-        headers
-    }
-
-    #[test]
-    fn parse_next_link_present() {
-        let headers = header_map_with_link(
-            r#"<https://api.github.com/user/123/following?page=2>; rel="next", <https://api.github.com/user/123/following?page=10>; rel="last""#,
-        );
-        assert_eq!(
-            parse_next_link(&headers),
-            Some("https://api.github.com/user/123/following?page=2".into())
-        );
-    }
-
-    #[test]
-    fn parse_next_link_single() {
-        let headers = header_map_with_link(
-            r#"<https://api.github.com/resource?page=3>; rel="next""#,
-        );
-        assert_eq!(
-            parse_next_link(&headers),
-            Some("https://api.github.com/resource?page=3".into())
-        );
-    }
-
-    #[test]
-    fn parse_next_link_only_last() {
-        let headers = header_map_with_link(
-            r#"<https://api.github.com/resource?page=1>; rel="last""#,
-        );
-        assert_eq!(parse_next_link(&headers), None);
-    }
-
-    #[test]
-    fn parse_next_link_missing_header() {
-        let headers = HeaderMap::new();
-        assert_eq!(parse_next_link(&headers), None);
-    }
-
-    // ---------------------------------------------------------------
-    // GithubApiUser → GithubUser conversion
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn deserialize_github_api_user() {
-        let json = r#"{
-            "login": "octocat",
-            "name": "The Octocat",
-            "avatar_url": "https://avatars.githubusercontent.com/u/583231?v=4",
-            "company": "@github",
-            "location": "San Francisco",
-            "followers": 3938,
-            "following": 9,
-            "public_repos": 8,
-            "created_at": "2011-01-25T18:44:36Z",
-            "updated_at": "2025-06-15T12:00:00Z"
-        }"#;
-
-        let api_user: GithubApiUser =
-            serde_json::from_str(json).expect("deserialize");
-        let user = GithubUser::from(api_user);
-
-        assert_eq!(user.login, "octocat");
-        assert_eq!(user.name.as_deref(), Some("The Octocat"));
-        assert_eq!(user.followers, 3938);
-        assert_eq!(user.following, 9);
-        assert_eq!(user.public_repos, 8);
-    }
-
-    // ---------------------------------------------------------------
-    // Rate-limit checks
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn check_rate_limit_remaining() {
-        let client = GithubClient {
-            client: Client::new(),
-            token: "fake".into(),
-            rate_limit: Arc::new(Mutex::new(RateLimit {
-                remaining: 10,
-                reset_at: 0,
-            })),
-        };
-        assert!(client.check_rate_limit().is_ok());
-    }
-
-    #[test]
-    fn check_rate_limit_exceeded_future_reset() {
-        let far_future = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            + 3600;
-
-        let client = GithubClient {
-            client: Client::new(),
-            token: "fake".into(),
-            rate_limit: Arc::new(Mutex::new(RateLimit {
-                remaining: 0,
-                reset_at: far_future,
-            })),
-        };
-        match client.check_rate_limit() {
-            Err(GithubError::RateLimitExceeded(ts)) => assert_eq!(ts, far_future),
-            other => panic!("expected RateLimitExceeded, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_rate_limit_window_passed() {
-        let past = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 60;
-
-        let client = GithubClient {
-            client: Client::new(),
-            token: "fake".into(),
-            rate_limit: Arc::new(Mutex::new(RateLimit {
-                remaining: 0,
-                reset_at: past,
-            })),
-        };
-        // Window has passed – should be allowed through.
-        assert!(client.check_rate_limit().is_ok());
     }
 }

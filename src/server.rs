@@ -7,9 +7,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::crawlers::FollowCrawler;
+use crate::crawlers::{CrawlerError, FollowCrawler};
 use crate::db::Db;
-use crate::github::GithubClient;
+use crate::github::{GithubApi, GithubClient, GithubError};
 use crate::types::{CrawlEvent, ServerResponse, StatusData};
 
 // ── Shared state ──────────────────────────────────────────────────────────
@@ -234,14 +234,12 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
                 let new_connections = crawl_result.new_edges.len();
                 state.users_crawled.fetch_add(1, Ordering::SeqCst);
 
-                // Broadcast completion
                 let _ = state.event_tx.send(CrawlEvent::UserDone {
                     login: scope.clone(),
                     degree,
                     new_connections,
                 });
 
-                // Broadcast newly queued users
                 let next_degree = degree + 1;
                 for user in &crawl_result.new_users {
                     let _ = state.event_tx.send(CrawlEvent::UserQueued {
@@ -255,9 +253,21 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
                     crawl_result.new_users.len()
                 );
             }
+            Err(CrawlerError::Github(GithubError::RateLimitExceeded(reset_at))) => {
+                eprintln!("Rate limited on {scope}, sleeping until reset…");
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let wait = (reset_at - now).max(5) as u64;
+                eprintln!("  Sleeping {wait}s…");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                // Don't mark as done — retry after sleep
+                *state.currently_crawling.write().await = None;
+                continue;
+            }
             Err(e) => {
                 eprintln!("Error crawling {scope}: {e}");
-                // Mark as done so we don't retry the same scope endlessly
                 let db_guard = db.lock().await;
                 if let Err(e2) = db_guard.mark_crawl_done("follow_crawler", &scope) {
                     eprintln!("  Also failed to mark {scope} as done: {e2}");
@@ -279,10 +289,16 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64;
-            let wait = (rl.reset_at - now).max(0) as u64;
+            let wait = if rl.reset_at > now {
+                (rl.reset_at - now) as u64
+            } else {
+                // reset_at is 0 or in the past — don't know when it resets.
+                // Sleep a conservative amount and hope for the best.
+                60
+            };
             if wait > 0 {
                 eprintln!(
-                    "Rate limit low ({} remaining), sleeping {wait}s until reset…",
+                    "Rate limit low ({} remaining), sleeping {wait}s…",
                     rl.remaining
                 );
                 tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -441,9 +457,7 @@ fn build_status_data(
     db: &Db,
     currently_crawling: Option<String>,
 ) -> Result<StatusData, Box<dyn std::error::Error>> {
-    let users_crawled = state.users_crawled.load(Ordering::SeqCst);
-    // Count pending scopes.  Using a large limit is acceptable for a
-    // CLI tool; a production system would have a dedicated COUNT query.
+    let users_crawled = db.get_crawled_count("follow_crawler")? as u64;
     let users_queued = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
     let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);

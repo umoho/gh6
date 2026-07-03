@@ -404,6 +404,16 @@ impl Db {
         Ok(count > 0)
     }
 
+    /// Count how many scopes have been crawled (status = 'done').
+    pub fn get_crawled_count(&self, crawler_name: &str) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM crawl_state WHERE crawler_name = ?1 AND status = 'done'",
+            params![crawler_name],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Look up a user by primary-key id.
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>, DbError> {
         let mut stmt = self.conn.prepare(
