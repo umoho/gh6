@@ -79,9 +79,14 @@ impl Db {
         // Enable WAL mode for better concurrent read/write performance
         conn.execute_batch("PRAGMA journal_mode=WAL")?;
 
-        // Run migrations
+        // Run migrations (idempotent — ignore duplicate-column errors)
         conn.execute_batch(MIGRATION_SQL)?;
-        conn.execute_batch(include_str!("../migrations/002_priority.sql"))?;
+        if let Err(e) = conn.execute_batch(include_str!("../migrations/002_priority.sql")) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
 
         Ok(Self { conn })
     }

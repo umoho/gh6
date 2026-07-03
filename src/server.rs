@@ -1,3 +1,5 @@
+use log::{error, info, warn};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
@@ -82,7 +84,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = UnixListener::bind(&socket_path)
         .map_err(|e| format!("failed to bind socket {}: {e}", socket_path.display()))?;
-    eprintln!("Listening on {}", socket_path.display());
+    info!("Listening on {}", socket_path.display());
 
     // 4. Seed the database if empty (first run)
     {
@@ -91,7 +93,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
             .get_user_count()
             .map_err(|e| format!("db error: {e}"))?;
         if user_count == 0 {
-            eprintln!("First run: fetching seed user 'umoho'…");
+            info!("First run: fetching seed user 'umoho'…");
             let umoho = client
                 .get_user("umoho")
                 .await
@@ -102,7 +104,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
             db_guard
                 .insert_pending_scope(&crawler_name, "umoho")
                 .map_err(|e| format!("db error seeding scope: {e}"))?;
-            eprintln!("Seed user 'umoho' added.");
+            info!("Seed user 'umoho' added.");
         }
     }
 
@@ -133,17 +135,17 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
                         let cn = crawler_name.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(stream, state, db, &cn).await {
-                                eprintln!("Client handler error: {e}");
+                                error!("Client handler error: {e}");
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("Accept error: {e}");
+                        error!("Accept error: {e}");
                     }
                 }
             }
             _ = &mut crawl_done_rx => {
-                eprintln!("Crawl loop exited, shutting down server…");
+                info!("Crawl loop exited, shutting down server…");
                 break;
             }
         }
@@ -153,10 +155,10 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(&socket_path);
     let db_guard = db.lock().await;
     match db_guard.get_user_count() {
-        Ok(total) => eprintln!("Total users in database: {total}"),
-        Err(e) => eprintln!("Could not read user count: {e}"),
+        Ok(total) => info!("Total users in database: {total}"),
+        Err(e) => info!("Could not read user count: {e}"),
     }
-    eprintln!("Server stopped.");
+    info!("Server stopped.");
     Ok(())
 }
 
@@ -170,7 +172,7 @@ async fn crawl_loop(
 ) {
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
-            eprintln!("Shutdown signaled, exiting crawl loop…");
+            info!("Shutdown signaled, exiting crawl loop…");
             break;
         }
 
@@ -184,7 +186,7 @@ async fn crawl_loop(
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("Error fetching pending scopes: {e}");
+                    error!("Error fetching pending scopes: {e}");
                     drop(db_guard);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
@@ -214,7 +216,7 @@ async fn crawl_loop(
                     drop(db_guard);
 
                     if count >= HUB_FOLLOWING_THRESHOLD {
-                        eprintln!("Deferring hub {scope} ({count} following)");
+                        info!("Deferring hub {scope} ({count} following)");
                         let db_guard = db.lock().await;
                         let _ = db_guard.set_priority(crawler_name, &scope, "low");
                         drop(db_guard);
@@ -223,7 +225,7 @@ async fn crawl_loop(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to fetch profile for {scope}: {e}, skipping");
+                    warn!("Failed to fetch profile for {scope}: {e}, skipping");
                     let db_guard = db.lock().await;
                     let _ = db_guard.mark_crawl_done(crawler_name, &scope);
                     drop(db_guard);
@@ -250,7 +252,7 @@ async fn crawl_loop(
         };
         state.current_degree.store(degree, Ordering::SeqCst);
 
-        eprintln!("Crawling: {scope} (degree {degree})");
+        info!("Crawling: {scope} (degree {degree})");
 
         let result =
             FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree).await;
@@ -273,16 +275,16 @@ async fn crawl_loop(
                     });
                 }
 
-                eprintln!(
+                info!(
                     "  Done: {new_connections} new connections, {} users in following",
                     crawl_result.new_users.len()
                 );
             }
             Err(e) => {
-                eprintln!("Error crawling {scope}: {e}");
+                error!("Error crawling {scope}: {e}");
                 let db_guard = db.lock().await;
                 if let Err(e2) = db_guard.mark_crawl_done(crawler_name, &scope) {
-                    eprintln!("  Also failed to mark {scope} as done: {e2}");
+                    error!("  Also failed to mark {scope} as done: {e2}");
                 }
             }
         }
@@ -304,7 +306,7 @@ async fn crawl_loop(
                 60
             };
             if wait > 0 {
-                eprintln!(
+                warn!(
                     "Rate limit low ({} remaining), sleeping {wait}s…",
                     rl.remaining
                 );
