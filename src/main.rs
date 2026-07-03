@@ -2,6 +2,7 @@ mod analyze;
 mod crawlers;
 mod db;
 mod github;
+mod types;
 
 use clap::{Parser, Subcommand};
 
