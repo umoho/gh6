@@ -27,6 +27,11 @@ pub trait Crawler: Send + Sync {
     fn name(&self) -> &str;
 
     /// Crawl a single scope and return newly discovered users and edges.
+    //
+    // TODO: have `crawl_loop` call this instead of `crawl_following`
+    // directly.  Currently suppressed because the crawl loop passes
+    // `degree` explicitly and does its own logging before calling
+    // the static `crawl_following` helper.
     #[allow(dead_code)]
     async fn crawl(
         &self,
