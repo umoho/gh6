@@ -334,6 +334,72 @@ impl Db {
     }
 
     // -----------------------------------------------------------------------
+    // All-paths search
+    // -----------------------------------------------------------------------
+
+    /// Find all simple paths between two users (DFS, depth-limited).
+    pub fn get_all_paths(
+        &self,
+        from_login: &str,
+        to_login: &str,
+    ) -> Result<Vec<Vec<User>>, DbError> {
+        let from_user = self.get_user_by_login(from_login)?;
+        let to_user = self.get_user_by_login(to_login)?;
+        let (from_id, to_id) = match (&from_user, &to_user) {
+            (Some(f), Some(t)) => (f.id, t.id),
+            _ => return Ok(Vec::new()),
+        };
+        if from_id == to_id {
+            return Ok(vec![vec![from_user.unwrap()]]);
+        }
+
+        use std::collections::{HashMap, HashSet};
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT from_user_id, to_user_id FROM edges")?;
+        for pair in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
+            let (a, b) = pair?;
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+
+        let mut results: Vec<Vec<i64>> = Vec::new();
+        let mut visited = HashSet::new();
+        visited.insert(from_id);
+        dfs_all_paths(
+            &adj,
+            from_id,
+            to_id,
+            6,
+            50,
+            &mut vec![from_id],
+            &mut visited,
+            &mut results,
+        );
+
+        // Fetch users for each path
+        let mut cache: HashMap<i64, User> = HashMap::new();
+        let mut out = Vec::new();
+        for path_ids in &results {
+            let mut path = Vec::new();
+            for &uid in path_ids {
+                if let Some(u) = cache.get(&uid) {
+                    path.push(u.clone());
+                } else {
+                    let u = self
+                        .get_user_by_id(uid)?
+                        .ok_or(DbError::Rusqlite(rusqlite::Error::QueryReturnedNoRows))?;
+                    cache.insert(uid, u.clone());
+                    path.push(u);
+                }
+            }
+            out.push(path);
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
     // Analysis helpers
     // -----------------------------------------------------------------------
 
@@ -518,5 +584,39 @@ fn dirs() -> Result<PathBuf, DbError> {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set").into())
     } else {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported OS").into())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dfs_all_paths(
+    adj: &std::collections::HashMap<i64, Vec<i64>>,
+    current: i64,
+    target: i64,
+    max_depth: usize,
+    max_paths: usize,
+    path: &mut Vec<i64>,
+    visited: &mut std::collections::HashSet<i64>,
+    results: &mut Vec<Vec<i64>>,
+) {
+    if results.len() >= max_paths || path.len() > max_depth {
+        return;
+    }
+    if current == target {
+        results.push(path.clone());
+        return;
+    }
+    if let Some(neighbors) = adj.get(&current) {
+        for &neighbor in neighbors {
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            visited.insert(neighbor);
+            path.push(neighbor);
+            dfs_all_paths(
+                adj, neighbor, target, max_depth, max_paths, path, visited, results,
+            );
+            path.pop();
+            visited.remove(&neighbor);
+        }
     }
 }

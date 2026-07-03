@@ -20,7 +20,7 @@ mod types;
 
 use log::info;
 
-use crate::analyze::{FuzzyPathResult, NeighborsResult};
+use crate::analyze::{AllPathsResult, FuzzyPathResult, NeighborsResult};
 use crate::db::Db;
 use crate::types::*;
 
@@ -65,7 +65,13 @@ enum Command {
 #[derive(Subcommand)]
 enum AnalyzeCommand {
     /// Find shortest path from seed user (umoho) to target
-    Path { user: String },
+    Path {
+        user: String,
+        #[arg(long, default_value = "umoho")]
+        from: String,
+        #[arg(long)]
+        all: bool,
+    },
     /// Show a user's direct connections
     Neighbors { user: String },
     /// Show distribution of users by BFS degree
@@ -524,6 +530,37 @@ fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
     }
 }
 
+fn print_all_paths(paths: &AllPathsResult, json: bool) {
+    if json {
+        let out: Vec<Vec<&str>> = paths
+            .iter()
+            .map(|p| p.iter().map(|u| u.login.as_str()).collect())
+            .collect();
+        println!("{}", serde_json::to_string(&out).unwrap());
+        return;
+    }
+    let arrow = "→".dimmed();
+    for (i, path) in paths.iter().enumerate() {
+        let route: Vec<String> = path
+            .iter()
+            .enumerate()
+            .map(|(j, u)| {
+                if j == 0 {
+                    u.login.bold().to_string()
+                } else if j == path.len() - 1 {
+                    u.login.green().bold().to_string()
+                } else {
+                    u.login.to_string()
+                }
+            })
+            .collect();
+        let steps = path.len() - 1;
+        let s = format!("{:>3}.", i + 1);
+        let idx = s.dimmed();
+        println!("{idx} {} ({steps} 步)", route.join(&format!(" {arrow} ")));
+    }
+}
+
 fn print_export(users: usize, edges: usize, file: &str, json: bool) {
     if json {
         println!(
@@ -606,21 +643,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Analyze { sub } => {
             let db = Db::open()?;
             match sub {
-                AnalyzeCommand::Path { user } => match analyze::cmd_path(&db, "umoho", &user)? {
-                    Some(path) => print_path(&path, cli.json),
-                    None => {
-                        let matches = analyze::cmd_fuzzy_path(&db, "umoho", &user)?;
-                        if matches.is_empty() {
-                            if cli.json {
-                                println!("[]");
+                AnalyzeCommand::Path { user, from, all } => {
+                    let found = analyze::cmd_path(&db, &from, &user)?;
+                    if all {
+                        let paths = analyze::cmd_all_paths(&db, &from, &user)?;
+                        if paths.is_empty() {
+                            let matches = analyze::cmd_fuzzy_path(&db, &from, &user)?;
+                            if matches.is_empty() {
+                                if cli.json {
+                                    println!("[]");
+                                } else {
+                                    println!("未找到匹配");
+                                }
                             } else {
-                                println!("未找到匹配 {} 的用户", user.dimmed());
+                                print_fuzzy_paths(&matches, cli.json);
                             }
                         } else {
-                            print_fuzzy_paths(&matches, cli.json);
+                            print_all_paths(&paths, cli.json);
+                        }
+                    } else {
+                        match found {
+                            Some(path) => print_path(&path, cli.json),
+                            None => {
+                                let matches = analyze::cmd_fuzzy_path(&db, &from, &user)?;
+                                if matches.is_empty() {
+                                    if cli.json {
+                                        println!("[]");
+                                    } else {
+                                        println!("未找到匹配 {} 的用户", user.dimmed());
+                                    }
+                                } else {
+                                    print_fuzzy_paths(&matches, cli.json);
+                                }
+                            }
                         }
                     }
-                },
+                }
                 AnalyzeCommand::Neighbors { user } => {
                     let result = analyze::cmd_neighbors(&db, &user)?;
                     print_neighbors(&result, cli.json);
