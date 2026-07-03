@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use serde_json;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -84,7 +83,9 @@ fn socket_path() -> PathBuf {
 const NOT_RUNNING_MSG: &str = "gh6 crawl is not running. Start it with: gh6 crawl &";
 
 /// One-shot: send a command, read the first response line, return it.
-async fn send_socket_command(cmd: &serde_json::Value) -> Result<ServerResponse, Box<dyn std::error::Error>> {
+async fn send_socket_command(
+    cmd: &serde_json::Value,
+) -> Result<ServerResponse, Box<dyn std::error::Error>> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)
         .await
@@ -105,7 +106,10 @@ async fn send_socket_command(cmd: &serde_json::Value) -> Result<ServerResponse, 
 }
 
 /// Watch mode: send command, then loop reading event lines until EOF or Bye.
-async fn watch_socket(cmd: &serde_json::Value, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn watch_socket(
+    cmd: &serde_json::Value,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)
         .await
@@ -342,36 +346,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Analyze { sub } => {
             let db = Db::open().map_err(|e| format!("Failed to open database: {e}"))?;
             match sub {
-                AnalyzeCommand::Path { user } => {
-                    match analyze::cmd_path(&db, "umoho", &user)? {
-                        Some(path) => {
-                            if cli.json {
-                                let logins: Vec<&str> = path.iter().map(|u| u.login.as_str()).collect();
-                                println!("{}", serde_json::to_string(&logins)?);
-                            } else {
-                                let steps = path.len() - 1;
-                                let route: Vec<&str> = path.iter().map(|u| u.login.as_str()).collect();
-                                println!("{}", route.join(" → "));
-                                println!("({steps} steps)");
-                            }
-                        }
-                        None => {
-                            if cli.json {
-                                println!("null");
-                            } else {
-                                println!("No path found from umoho to {user}");
-                            }
+                AnalyzeCommand::Path { user } => match analyze::cmd_path(&db, "umoho", &user)? {
+                    Some(path) => {
+                        if cli.json {
+                            let logins: Vec<&str> = path.iter().map(|u| u.login.as_str()).collect();
+                            println!("{}", serde_json::to_string(&logins)?);
+                        } else {
+                            let steps = path.len() - 1;
+                            let route: Vec<&str> = path.iter().map(|u| u.login.as_str()).collect();
+                            println!("{}", route.join(" → "));
+                            println!("({steps} steps)");
                         }
                     }
-                }
+                    None => {
+                        if cli.json {
+                            println!("null");
+                        } else {
+                            println!("No path found from umoho to {user}");
+                        }
+                    }
+                },
                 AnalyzeCommand::Neighbors { user } => {
                     let result = analyze::cmd_neighbors(&db, &user)?;
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
                         println!("👤 {}", result.login);
-                        println!("  Following ({}): {}", result.following.len(), result.following.join(", "));
-                        println!("  Followers ({}): {}", result.followers.len(), result.followers.join(", "));
+                        println!(
+                            "  Following ({}): {}",
+                            result.following.len(),
+                            result.following.join(", ")
+                        );
+                        println!(
+                            "  Followers ({}): {}",
+                            result.followers.len(),
+                            result.followers.join(", ")
+                        );
                     }
                 }
                 AnalyzeCommand::DegreeDist => {

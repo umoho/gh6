@@ -1,15 +1,15 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::crawlers::{CrawlerError, FollowCrawler};
+use crate::crawlers::{FOLLOW_CRAWLER, FollowCrawler};
 use crate::db::Db;
-use crate::github::{GithubApi, GithubClient, GithubError};
+use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlEvent, ServerResponse, StatusData};
 
 // ── Shared state ──────────────────────────────────────────────────────────
@@ -96,21 +96,10 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| format!("failed to fetch seed user 'umoho': {e}"))?;
             db_guard
-                .upsert_user(
-                    &umoho.login,
-                    umoho.name.as_deref(),
-                    umoho.avatar_url.as_deref(),
-                    umoho.company.as_deref(),
-                    umoho.location.as_deref(),
-                    umoho.followers,
-                    umoho.following,
-                    umoho.public_repos,
-                    umoho.created_at.as_deref(),
-                    umoho.updated_at.as_deref(),
-                )
+                .upsert_user(&umoho)
                 .map_err(|e| format!("db error seeding user: {e}"))?;
             db_guard
-                .insert_pending_scope("follow_crawler", "umoho")
+                .insert_pending_scope(FOLLOW_CRAWLER, "umoho")
                 .map_err(|e| format!("db error seeding scope: {e}"))?;
             eprintln!("Seed user 'umoho' added.");
         }
@@ -183,7 +172,7 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
         // Fetch the next pending scope
         let scope = {
             let db_guard = db.lock().await;
-            match db_guard.pending_scopes("follow_crawler", 1) {
+            match db_guard.pending_scopes(FOLLOW_CRAWLER, 1) {
                 Ok(scopes) if !scopes.is_empty() => scopes.into_iter().next().unwrap(),
                 Ok(_) => {
                     drop(db_guard);
@@ -226,8 +215,7 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
 
         // Perform the actual crawl. `crawl_following` handles its own
         // locking and releases the mutex before making HTTP requests.
-        let result =
-            FollowCrawler::crawl_following(&client, &db, &scope, degree).await;
+        let result = FollowCrawler::crawl_following(&client, &db, &scope, degree).await;
 
         match result {
             Ok(crawl_result) => {
@@ -253,23 +241,10 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
                     crawl_result.new_users.len()
                 );
             }
-            Err(CrawlerError::Github(GithubError::RateLimitExceeded(reset_at))) => {
-                eprintln!("Rate limited on {scope}, sleeping until reset…");
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                let wait = (reset_at - now).max(5) as u64;
-                eprintln!("  Sleeping {wait}s…");
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                // Don't mark as done — retry after sleep
-                *state.currently_crawling.write().await = None;
-                continue;
-            }
             Err(e) => {
                 eprintln!("Error crawling {scope}: {e}");
                 let db_guard = db.lock().await;
-                if let Err(e2) = db_guard.mark_crawl_done("follow_crawler", &scope) {
+                if let Err(e2) = db_guard.mark_crawl_done(FOLLOW_CRAWLER, &scope) {
                     eprintln!("  Also failed to mark {scope} as done: {e2}");
                 }
             }
@@ -457,8 +432,8 @@ fn build_status_data(
     db: &Db,
     currently_crawling: Option<String>,
 ) -> Result<StatusData, Box<dyn std::error::Error>> {
-    let users_crawled = db.get_crawled_count("follow_crawler")? as u64;
-    let users_queued = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
+    let users_crawled = db.get_crawled_count(FOLLOW_CRAWLER)? as u64;
+    let users_queued = db.pending_scopes(FOLLOW_CRAWLER, 10_000_000)?.len() as u64;
     let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
     let api_reset_at = state.api_reset_at.load(Ordering::SeqCst);

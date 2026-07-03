@@ -1,8 +1,8 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::types::{DegreeDist, Edge, NewEdge, User};
+use crate::types::{DegreeDist, Edge, GithubUser, NewEdge, User};
 
 // ---------------------------------------------------------------------------
 // Migration SQL (embedded, not read from file at runtime)
@@ -55,9 +55,6 @@ pub enum DbError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("not found")]
-    NotFound,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,19 +90,7 @@ impl Db {
     // -----------------------------------------------------------------------
 
     /// Insert or replace a user. Returns the row id of the inserted/updated user.
-    pub fn upsert_user(
-        &self,
-        login: &str,
-        name: Option<&str>,
-        avatar_url: Option<&str>,
-        company: Option<&str>,
-        location: Option<&str>,
-        followers: i64,
-        following: i64,
-        public_repos: i64,
-        created_at: Option<&str>,
-        updated_at: Option<&str>,
-    ) -> Result<i64, DbError> {
+    pub fn upsert_user(&self, u: &GithubUser) -> Result<i64, DbError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO users (id, login, name, avatar_url, company, location, \
              followers, following, public_repos, created_at, updated_at) \
@@ -114,16 +99,16 @@ impl Db {
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
              )",
             params![
-                login,
-                name,
-                avatar_url,
-                company,
-                location,
-                followers,
-                following,
-                public_repos,
-                created_at,
-                updated_at,
+                u.login,
+                u.name,
+                u.avatar_url,
+                u.company,
+                u.location,
+                u.followers,
+                u.following,
+                u.public_repos,
+                u.created_at,
+                u.updated_at,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -243,9 +228,8 @@ impl Db {
             .conn
             .prepare("SELECT from_user_id, to_user_id FROM edges")?;
 
-        let edge_rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let edge_rows =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
 
         for pair in edge_rows {
             let (a, b) = pair?;
@@ -344,11 +328,7 @@ impl Db {
 
     /// Get pending scopes for a crawler, ordered by degree (ascending), limited.
     /// The scope_key is the user login string.
-    pub fn pending_scopes(
-        &self,
-        crawler_name: &str,
-        limit: usize,
-    ) -> Result<Vec<String>, DbError> {
+    pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT scope_key FROM crawl_state \
              WHERE crawler_name = ?1 AND status = 'pending' \
@@ -364,11 +344,7 @@ impl Db {
     }
 
     /// Mark a crawler scope as done.
-    pub fn mark_crawl_done(
-        &self,
-        crawler_name: &str,
-        scope_key: &str,
-    ) -> Result<(), DbError> {
+    pub fn mark_crawl_done(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError> {
         self.conn.execute(
             "UPDATE crawl_state SET status = 'done', crawled_at = datetime('now') \
              WHERE crawler_name = ?1 AND scope_key = ?2",
@@ -378,11 +354,7 @@ impl Db {
     }
 
     /// Insert a pending crawl scope. Uses INSERT OR IGNORE for idempotency.
-    pub fn insert_pending_scope(
-        &self,
-        crawler_name: &str,
-        scope_key: &str,
-    ) -> Result<(), DbError> {
+    pub fn insert_pending_scope(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO crawl_state (crawler_name, scope_key) VALUES (?1, ?2)",
             params![crawler_name, scope_key],
@@ -391,11 +363,7 @@ impl Db {
     }
 
     /// Check whether a crawl state record exists for the given crawler + scope.
-    pub fn has_crawl_state(
-        &self,
-        crawler_name: &str,
-        scope_key: &str,
-    ) -> Result<bool, DbError> {
+    pub fn has_crawl_state(&self, crawler_name: &str, scope_key: &str) -> Result<bool, DbError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM crawl_state WHERE crawler_name = ?1 AND scope_key = ?2",
             params![crawler_name, scope_key],

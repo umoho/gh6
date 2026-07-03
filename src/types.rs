@@ -33,6 +33,7 @@ pub struct RateLimit {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct User {
     pub id: i64,
     pub login: String,
@@ -58,6 +59,7 @@ pub struct NewEdge {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Edge {
     pub from_user_id: i64,
     pub to_user_id: i64,

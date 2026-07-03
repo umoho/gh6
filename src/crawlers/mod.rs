@@ -5,6 +5,9 @@ use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlResult, GithubUser, NewEdge};
 
+/// Crawler name constant — used as `crawler_name` in crawl_state table.
+pub const FOLLOW_CRAWLER: &str = "follow_crawler";
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
@@ -21,10 +24,8 @@ pub enum CrawlerError {
 
 /// Every crawler explores a different dimension of the GitHub social graph.
 pub trait Crawler {
-    /// Unique name used as `crawler_name` in the `crawl_state` table.
-    fn name(&self) -> &str;
-
     /// Crawl a single scope and return newly discovered users and edges.
+    #[allow(dead_code)]
     async fn crawl(
         &self,
         scope_key: &str,
@@ -38,6 +39,7 @@ pub trait Crawler {
 /// Stateless crawler that follows `following` edges (BFS layer by layer).
 pub struct FollowCrawler;
 
+#[allow(dead_code)]
 impl FollowCrawler {
     pub fn new() -> Self {
         Self
@@ -75,18 +77,7 @@ impl FollowCrawler {
             let db_guard = db.lock().await;
 
             for gh_user in &following {
-                let to_user_id = db_guard.upsert_user(
-                    &gh_user.login,
-                    gh_user.name.as_deref(),
-                    gh_user.avatar_url.as_deref(),
-                    gh_user.company.as_deref(),
-                    gh_user.location.as_deref(),
-                    gh_user.followers,
-                    gh_user.following,
-                    gh_user.public_repos,
-                    gh_user.created_at.as_deref(),
-                    gh_user.updated_at.as_deref(),
-                )?;
+                let to_user_id = db_guard.upsert_user(gh_user)?;
 
                 let edge = NewEdge {
                     from_user_id,
@@ -99,16 +90,15 @@ impl FollowCrawler {
                 db_guard.insert_edge(&edge)?;
                 new_edges.push(edge);
 
-                let already_crawled =
-                    db_guard.has_crawl_state("follow_crawler", &gh_user.login)?;
+                let already_crawled = db_guard.has_crawl_state(FOLLOW_CRAWLER, &gh_user.login)?;
                 if !already_crawled {
-                    db_guard.insert_pending_scope("follow_crawler", &gh_user.login)?;
+                    db_guard.insert_pending_scope(FOLLOW_CRAWLER, &gh_user.login)?;
                 }
 
                 new_users.push(gh_user.clone());
             }
 
-            db_guard.mark_crawl_done("follow_crawler", login)?;
+            db_guard.mark_crawl_done(FOLLOW_CRAWLER, login)?;
         }
 
         Ok(CrawlResult {
@@ -120,11 +110,8 @@ impl FollowCrawler {
 
 // ── Trait implementation ──────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 impl Crawler for FollowCrawler {
-    fn name(&self) -> &str {
-        "follow_crawler"
-    }
-
     async fn crawl(
         &self,
         scope_key: &str,

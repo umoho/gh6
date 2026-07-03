@@ -18,9 +18,6 @@ pub enum GithubError {
 
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("rate limit exceeded; resets at unix timestamp {0}")]
-    RateLimitExceeded(i64),
 }
 
 // ---------------------------------------------------------------------------
@@ -122,16 +119,12 @@ impl GhClient {
         let args_display = args_owned.join(" ");
 
         let output = tokio::task::spawn_blocking(move || {
-            Command::new("gh")
-                .arg("api")
-                .args(&args_owned)
-                .output()
+            Command::new("gh").arg("api").args(&args_owned).output()
         })
         .await
         .map_err(|e| GithubError::Command(format!("spawn_blocking failed: {e}")))?;
 
-        let output =
-            output.map_err(|e| GithubError::Command(format!("gh api: {e}")))?;
+        let output = output.map_err(|e| GithubError::Command(format!("gh api: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -147,13 +140,12 @@ impl GhClient {
     /// Refresh cached rate-limit info from `/rate_limit`.
     async fn refresh_rate_limit(&self) {
         // Best-effort — don't fail the whole operation if this fails.
-        if let Ok(json) = self.gh(&["/rate_limit", "--jq", ".rate"]).await {
-            if let Ok(rl) = serde_json::from_str::<GhRateLimit>(&json) {
-                if let Ok(mut guard) = self.rate_limit.lock() {
-                    guard.remaining = rl.remaining;
-                    guard.reset_at = rl.reset;
-                }
-            }
+        if let Ok(json) = self.gh(&["/rate_limit", "--jq", ".rate"]).await
+            && let Ok(rl) = serde_json::from_str::<GhRateLimit>(&json)
+            && let Ok(mut guard) = self.rate_limit.lock()
+        {
+            guard.remaining = rl.remaining;
+            guard.reset_at = rl.reset;
         }
     }
 }
