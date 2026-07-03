@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use chrono::{Local, TimeZone};
+
 use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 use tabled::{
@@ -107,47 +109,32 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
-fn fmt_utc(ts: i64) -> String {
+fn fmt_reset(ts: i64) -> String {
     if ts == 0 {
         return "(unknown)".into();
     }
-    let (y, mo, d, h, mi, s) = unix_to_utc(ts);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
-}
+    let local = Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".into());
 
-fn unix_to_utc(ts: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let secs = ts.rem_euclid(86400);
-    let mut days = ts.div_euclid(86400);
-    let hour = (secs / 3600) as u32;
-    let min = ((secs % 3600) / 60) as u32;
-    let sec = (secs % 60) as u32;
-    let mut year = 1970i64;
-    loop {
-        let diy = if is_leap(year) { 366 } else { 365 };
-        if days < diy {
-            break;
-        }
-        days -= diy;
-        year += 1;
-    }
-    static MD: [[i64; 12]; 2] = [
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
-    ];
-    let li = if is_leap(year) { 1 } else { 0 };
-    let mut month = 1u32;
-    for &md in &MD[li] {
-        if days < md {
-            break;
-        }
-        days -= md;
-        month += 1;
-    }
-    (year, month, (days + 1) as u32, hour, min, sec)
-}
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let remaining = (ts - now).max(0);
 
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    let rel = if remaining < 60 {
+        format!("{}s", remaining)
+    } else if remaining < 3600 {
+        format!("{}m {}s", remaining / 60, remaining % 60)
+    } else {
+        let h = remaining / 3600;
+        let m = (remaining % 3600) / 60;
+        format!("{h}h {m}m")
+    };
+    format!("{local} (in {rel})")
 }
 
 fn bar(width: u64, max: u64, bar_width: usize) -> String {
@@ -316,7 +303,7 @@ fn print_status(data: &StatusData, json: bool) {
         },
         StatusRow {
             label: "下次重置".into(),
-            value: fmt_utc(data.api_reset_at),
+            value: fmt_reset(data.api_reset_at),
         },
         StatusRow {
             label: "运行时间".into(),
