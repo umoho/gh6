@@ -5,9 +5,6 @@ use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlResult, GithubUser, NewEdge};
 
-/// Crawler name constant — used as `crawler_name` in crawl_state table.
-pub const FOLLOW_CRAWLER: &str = "follow_crawler";
-
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
@@ -23,7 +20,12 @@ pub enum CrawlerError {
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 /// Every crawler explores a different dimension of the GitHub social graph.
-pub trait Crawler {
+/// The [`name`](Crawler::name) is used as the `crawler_name` key in the
+/// `crawl_state` table, allowing multiple crawlers to coexist.
+pub trait Crawler: Send + Sync {
+    /// Unique identifier used in `crawl_state.crawler_name`.
+    fn name(&self) -> &str;
+
     /// Crawl a single scope and return newly discovered users and edges.
     #[allow(dead_code)]
     async fn crawl(
@@ -39,7 +41,6 @@ pub trait Crawler {
 /// Stateless crawler that follows `following` edges (BFS layer by layer).
 pub struct FollowCrawler;
 
-#[allow(dead_code)]
 impl FollowCrawler {
     pub fn new() -> Self {
         Self
@@ -48,9 +49,9 @@ impl FollowCrawler {
     /// Core logic: fetch `login`'s following list, persist users / edges,
     /// and enqueue newly discovered users for the next BFS layer.
     ///
-    /// Uses `AsyncMutex<Db>` and releases the lock before making HTTP requests
-    /// so the future remains `Send`.
+    /// `crawler_name` is the identifier used for `crawl_state` queries.
     pub async fn crawl_following(
+        crawler_name: &str,
         client: &GithubClient,
         db: &AsyncMutex<Db>,
         login: &str,
@@ -90,15 +91,16 @@ impl FollowCrawler {
                 db_guard.insert_edge(&edge)?;
                 new_edges.push(edge);
 
-                let already_crawled = db_guard.has_crawl_state(FOLLOW_CRAWLER, &gh_user.login)?;
+                let already_crawled =
+                    db_guard.has_crawl_state(crawler_name, &gh_user.login)?;
                 if !already_crawled {
-                    db_guard.insert_pending_scope(FOLLOW_CRAWLER, &gh_user.login)?;
+                    db_guard.insert_pending_scope(crawler_name, &gh_user.login)?;
                 }
 
                 new_users.push(gh_user.clone());
             }
 
-            db_guard.mark_crawl_done(FOLLOW_CRAWLER, login)?;
+            db_guard.mark_crawl_done(crawler_name, login)?;
         }
 
         Ok(CrawlResult {
@@ -108,10 +110,11 @@ impl FollowCrawler {
     }
 }
 
-// ── Trait implementation ──────────────────────────────────────────────────────
-
-#[allow(dead_code)]
 impl Crawler for FollowCrawler {
+    fn name(&self) -> &str {
+        "follow_crawler"
+    }
+
     async fn crawl(
         &self,
         scope_key: &str,
@@ -133,6 +136,7 @@ impl Crawler for FollowCrawler {
                 .unwrap_or(0)
         };
 
-        Self::crawl_following(client, db, scope_key, current_degree).await
+        Self::crawl_following(self.name(), client, db, scope_key, current_degree)
+            .await
     }
 }

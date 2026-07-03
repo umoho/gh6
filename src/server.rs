@@ -1,13 +1,13 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::crawlers::{FOLLOW_CRAWLER, FollowCrawler};
+use crate::crawlers::{Crawler, FollowCrawler};
 use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlEvent, ServerResponse, StatusData};
@@ -15,7 +15,6 @@ use crate::types::{CrawlEvent, ServerResponse, StatusData};
 // ── Shared state ──────────────────────────────────────────────────────────
 
 struct ServerState {
-    users_crawled: AtomicU64,
     currently_crawling: RwLock<Option<String>>,
     current_degree: AtomicI32,
     api_remaining: AtomicU32,
@@ -28,7 +27,6 @@ struct ServerState {
 impl ServerState {
     fn new(event_tx: broadcast::Sender<CrawlEvent>) -> Self {
         Self {
-            users_crawled: AtomicU64::new(0),
             currently_crawling: RwLock::new(None),
             current_degree: AtomicI32::new(0),
             api_remaining: AtomicU32::new(0),
@@ -44,6 +42,9 @@ impl ServerState {
 
 /// Start the crawl server: open db, seed, spawn crawl loop, listen on Unix socket.
 pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
+    let crawler = FollowCrawler::new();
+    let crawler_name = crawler.name().to_string();
+
     // 1. Open database
     let db = Db::open().map_err(|e| format!("failed to open database: {e}"))?;
     let db = Arc::new(Mutex::new(db));
@@ -63,9 +64,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Remove stale socket file from a previous run
     if socket_path.exists() {
-        // Try to connect to check if there is already a live server
         if let Ok(stream) = tokio::net::UnixStream::connect(&socket_path).await {
-            // A server is already listening – refuse to start a second instance
             drop(stream);
             return Err(format!(
                 "Another gh6 crawl instance is already running (socket {} exists and is live).\n\
@@ -74,7 +73,6 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        // Socket is stale – remove it
         std::fs::remove_file(&socket_path)
             .map_err(|e| format!("failed to remove stale socket: {e}"))?;
     }
@@ -99,7 +97,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
                 .upsert_user(&umoho)
                 .map_err(|e| format!("db error seeding user: {e}"))?;
             db_guard
-                .insert_pending_scope(FOLLOW_CRAWLER, "umoho")
+                .insert_pending_scope(&crawler_name, "umoho")
                 .map_err(|e| format!("db error seeding scope: {e}"))?;
             eprintln!("Seed user 'umoho' added.");
         }
@@ -109,18 +107,19 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, _) = broadcast::channel(256);
     let state = Arc::new(ServerState::new(event_tx));
 
-    // 6. Channel to signal crawl-loop completion (used for graceful shutdown)
+    // 6. Channel to signal crawl-loop completion
     let (crawl_done_tx, mut crawl_done_rx) = tokio::sync::oneshot::channel();
 
     // 7. Spawn the crawl loop
     let crawl_state = state.clone();
     let crawl_db = db.clone();
+    let cn = crawler_name.clone();
     tokio::spawn(async move {
-        crawl_loop(crawl_state, crawl_db, client).await;
+        crawl_loop(crawl_state, crawl_db, client, &cn).await;
         let _ = crawl_done_tx.send(());
     });
 
-    // 8. Accept client connections until the crawl loop finishes
+    // 8. Accept client connections
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -128,8 +127,9 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         let db = Arc::clone(&db);
+                        let cn = crawler_name.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, state, db).await {
+                            if let Err(e) = handle_client(stream, state, db, &cn).await {
                                 eprintln!("Client handler error: {e}");
                             }
                         });
@@ -148,35 +148,35 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Cleanup
     let _ = std::fs::remove_file(&socket_path);
-
     let db_guard = db.lock().await;
     match db_guard.get_user_count() {
         Ok(total) => eprintln!("Total users in database: {total}"),
         Err(e) => eprintln!("Could not read user count: {e}"),
     }
     eprintln!("Server stopped.");
-
     Ok(())
 }
 
 // ── Crawl loop ────────────────────────────────────────────────────────────
 
-async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubClient) {
+async fn crawl_loop(
+    state: Arc<ServerState>,
+    db: Arc<Mutex<Db>>,
+    client: GithubClient,
+    crawler_name: &str,
+) {
     loop {
-        // Check shutdown flag before each iteration
         if state.shutdown.load(Ordering::SeqCst) {
             eprintln!("Shutdown signaled, exiting crawl loop…");
             break;
         }
 
-        // Fetch the next pending scope
         let scope = {
             let db_guard = db.lock().await;
-            match db_guard.pending_scopes(FOLLOW_CRAWLER, 1) {
+            match db_guard.pending_scopes(crawler_name, 1) {
                 Ok(scopes) if !scopes.is_empty() => scopes.into_iter().next().unwrap(),
                 Ok(_) => {
                     drop(db_guard);
-                    // No pending work – wait and check again
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -189,11 +189,8 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
             }
         };
 
-        // Tell watchers who we are crawling right now
         *state.currently_crawling.write().await = Some(scope.clone());
 
-        // Determine the BFS degree for this user.
-        // For the seed (no incoming edges) it defaults to 0.
         let degree = {
             let db_guard = db.lock().await;
             match db_guard.get_user_by_login(&scope) {
@@ -213,14 +210,13 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
 
         eprintln!("Crawling: {scope} (degree {degree})");
 
-        // Perform the actual crawl. `crawl_following` handles its own
-        // locking and releases the mutex before making HTTP requests.
-        let result = FollowCrawler::crawl_following(&client, &db, &scope, degree).await;
+        let result =
+            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree)
+                .await;
 
         match result {
             Ok(crawl_result) => {
                 let new_connections = crawl_result.new_edges.len();
-                state.users_crawled.fetch_add(1, Ordering::SeqCst);
 
                 let _ = state.event_tx.send(CrawlEvent::UserDone {
                     login: scope.clone(),
@@ -244,21 +240,18 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
             Err(e) => {
                 eprintln!("Error crawling {scope}: {e}");
                 let db_guard = db.lock().await;
-                if let Err(e2) = db_guard.mark_crawl_done(FOLLOW_CRAWLER, &scope) {
+                if let Err(e2) = db_guard.mark_crawl_done(crawler_name, &scope) {
                     eprintln!("  Also failed to mark {scope} as done: {e2}");
                 }
             }
         }
 
-        // Update rate-limit info in shared state
         let rl = client.rate_limit();
         state.api_remaining.store(rl.remaining, Ordering::SeqCst);
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
 
-        // Clear "currently crawling"
         *state.currently_crawling.write().await = None;
 
-        // Rate-limit backoff
         if rl.remaining < 5 {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -267,8 +260,6 @@ async fn crawl_loop(state: Arc<ServerState>, db: Arc<Mutex<Db>>, client: GithubC
             let wait = if rl.reset_at > now {
                 (rl.reset_at - now) as u64
             } else {
-                // reset_at is 0 or in the past — don't know when it resets.
-                // Sleep a conservative amount and hope for the best.
                 60
             };
             if wait > 0 {
@@ -288,6 +279,7 @@ async fn handle_client(
     stream: UnixStream,
     state: Arc<ServerState>,
     db: Arc<Mutex<Db>>,
+    crawler_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (reader, writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
@@ -295,7 +287,6 @@ async fn handle_client(
     let mut line = String::new();
     let n = buf_reader.read_line(&mut line).await?;
     if n == 0 {
-        // Client disconnected without sending data
         return Ok(());
     }
 
@@ -307,9 +298,9 @@ async fn handle_client(
         "status" => {
             let watch = request["watch"].as_bool().unwrap_or(false);
             if watch {
-                handle_status_watch(writer, state, db).await?;
+                handle_status_watch(writer, state, db, crawler_name).await?;
             } else {
-                handle_status_once(writer, state, db).await?;
+                handle_status_once(writer, state, db, crawler_name).await?;
             }
         }
         "stop" => {
@@ -341,16 +332,16 @@ async fn handle_client(
 
 // ── Status handlers ───────────────────────────────────────────────────────
 
-/// One-shot status: build `StatusData`, send as `Ok`, close.
 async fn handle_status_once(
     mut writer: tokio::io::WriteHalf<UnixStream>,
     state: Arc<ServerState>,
     db: Arc<Mutex<Db>>,
+    crawler_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data = {
         let db_guard = db.lock().await;
         let currently_crawling = state.currently_crawling.read().await.clone();
-        build_status_data(&state, &db_guard, currently_crawling)?
+        build_status_data(&state, &db_guard, currently_crawling, crawler_name)?
     };
 
     let response = ServerResponse::Ok {
@@ -362,18 +353,16 @@ async fn handle_status_once(
     Ok(())
 }
 
-/// Watch status: send initial `StatusData`, then stream `CrawlEvent`s until
-/// the client disconnects or the server shuts down.
 async fn handle_status_watch(
     mut writer: tokio::io::WriteHalf<UnixStream>,
     state: Arc<ServerState>,
     db: Arc<Mutex<Db>>,
+    crawler_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ── Send initial status ────────────────────────────────────────────
     {
         let db_guard = db.lock().await;
         let currently_crawling = state.currently_crawling.read().await.clone();
-        let data = build_status_data(&state, &db_guard, currently_crawling)?;
+        let data = build_status_data(&state, &db_guard, currently_crawling, crawler_name)?;
         let response = ServerResponse::Ok {
             data: Some(serde_json::to_value(data)?),
         };
@@ -383,12 +372,9 @@ async fn handle_status_watch(
         }
     }
 
-    // ── Stream events ─────────────────────────────────────────────────
     let mut event_rx = state.event_tx.subscribe();
 
     loop {
-        // Wait for an event with a periodic timeout so we can check the
-        // shutdown flag even when the crawl loop is rate-limited / idle.
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await;
 
         match event {
@@ -396,21 +382,12 @@ async fn handle_status_watch(
                 let response = ServerResponse::Event { data: event };
                 let json = serde_json::to_string(&response)? + "\n";
                 if writer.write_all(json.as_bytes()).await.is_err() {
-                    // Client disconnected
                     break;
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Closed)) => {
-                // Sender dropped – no more events coming
-                break;
-            }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                // We missed some messages; just keep going
-                continue;
-            }
-            Err(_) => {
-                // Timeout elapsed – fall through to shutdown check
-            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Err(_) => {}
         }
 
         if state.shutdown.load(Ordering::SeqCst) {
@@ -426,14 +403,14 @@ async fn handle_status_watch(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Build a `StatusData` snapshot from shared state and a DB handle.
 fn build_status_data(
     state: &ServerState,
     db: &Db,
     currently_crawling: Option<String>,
+    crawler_name: &str,
 ) -> Result<StatusData, Box<dyn std::error::Error>> {
-    let users_crawled = db.get_crawled_count(FOLLOW_CRAWLER)? as u64;
-    let users_queued = db.pending_scopes(FOLLOW_CRAWLER, 10_000_000)?.len() as u64;
+    let users_crawled = db.get_crawled_count(crawler_name)? as u64;
+    let users_queued = db.pending_scopes(crawler_name, 10_000_000)?.len() as u64;
     let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
     let api_reset_at = state.api_reset_at.load(Ordering::SeqCst);
