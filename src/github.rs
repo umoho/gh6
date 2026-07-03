@@ -105,12 +105,15 @@ impl GhClient {
             return Err(GithubError::NoToken);
         }
 
-        Ok(Self {
+        let client = Self {
             rate_limit: Arc::new(Mutex::new(RateLimit {
-                remaining: 5000, // optimistic; refreshed on first call
+                remaining: 5000,
                 reset_at: 0,
             })),
-        })
+        };
+        // Best-effort: fetch real rate limit on startup
+        let _ = client.refresh_rate_limit().await;
+        Ok(client)
     }
 
     /// Run `gh api` with the given arguments, return stdout as string.

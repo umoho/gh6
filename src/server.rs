@@ -112,6 +112,13 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, _) = broadcast::channel(256);
     let state = Arc::new(ServerState::new(event_tx));
 
+    // Sync initial rate-limit from client
+    {
+        let rl = client.rate_limit();
+        state.api_remaining.store(rl.remaining, Ordering::SeqCst);
+        state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
+    }
+
     // 6. Channel to signal crawl-loop completion
     let (crawl_done_tx, mut crawl_done_rx) = tokio::sync::oneshot::channel();
 
