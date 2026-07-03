@@ -54,8 +54,13 @@ pub fn cmd_path(db: &Db, from: &str, to: &str) -> Result<Option<Vec<User>>, Box<
 pub type AllPathsResult = Vec<Vec<User>>;
 
 /// Find all paths between two users (DFS, depth-limited to 6, max 50 paths).
-pub fn cmd_all_paths(db: &Db, from: &str, to: &str) -> Result<AllPathsResult, Box<dyn Error>> {
-    Ok(db.get_all_paths(from, to)?)
+pub fn cmd_all_paths(
+    db: &Db,
+    from: &str,
+    to: &str,
+    limit: usize,
+) -> Result<AllPathsResult, Box<dyn Error>> {
+    Ok(db.get_all_paths(from, to, limit)?)
 }
 
 pub type FuzzyPathResult = Vec<(User, Vec<User>)>;

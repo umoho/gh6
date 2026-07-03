@@ -71,6 +71,9 @@ enum AnalyzeCommand {
         from: String,
         #[arg(long)]
         all: bool,
+        /// Max paths for --all (default: 200)
+        #[arg(long, default_value = "200")]
+        limit: usize,
     },
     /// Show a user's direct connections
     Neighbors { user: String },
@@ -643,10 +646,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Analyze { sub } => {
             let db = Db::open()?;
             match sub {
-                AnalyzeCommand::Path { user, from, all } => {
+                AnalyzeCommand::Path {
+                    user,
+                    from,
+                    all,
+                    limit,
+                } => {
                     let found = analyze::cmd_path(&db, &from, &user)?;
                     if all {
-                        let paths = analyze::cmd_all_paths(&db, &from, &user)?;
+                        let paths = analyze::cmd_all_paths(&db, &from, &user, limit)?;
                         if paths.is_empty() {
                             let matches = analyze::cmd_fuzzy_path(&db, &from, &user)?;
                             if matches.is_empty() {

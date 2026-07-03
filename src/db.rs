@@ -342,6 +342,7 @@ impl Db {
         &self,
         from_login: &str,
         to_login: &str,
+        max_paths: usize,
     ) -> Result<Vec<Vec<User>>, DbError> {
         let from_user = self.get_user_by_login(from_login)?;
         let to_user = self.get_user_by_login(to_login)?;
@@ -363,6 +364,10 @@ impl Db {
             adj.entry(a).or_default().push(b);
             adj.entry(b).or_default().push(a);
         }
+        // Cap neighbors per node to avoid explosion on hubs
+        for v in adj.values_mut() {
+            v.truncate(50);
+        }
 
         let mut results: Vec<Vec<i64>> = Vec::new();
         let mut visited = HashSet::new();
@@ -372,7 +377,7 @@ impl Db {
             from_id,
             to_id,
             6,
-            50,
+            max_paths,
             &mut vec![from_id],
             &mut visited,
             &mut results,
