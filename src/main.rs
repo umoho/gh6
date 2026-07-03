@@ -41,8 +41,13 @@ enum Command {
 
     /// Show crawl progress or watch real-time updates
     Status {
+        /// Watch for real-time events (keeps connection open)
         #[arg(long)]
         watch: bool,
+
+        /// Show a live status bar at the bottom (only with --watch)
+        #[arg(long)]
+        progress: bool,
     },
 
     /// Gracefully stop the running crawl server
@@ -154,7 +159,7 @@ fn bar(width: u64, max: u64, bar_width: usize) -> String {
 
 // ── Socket Client ────────────────────────────────────────────────────────────
 
-const NOT_RUNNING_MSG: &str = "gh6 crawl is not running. Start it with: gh6 crawl &";
+const NOT_RUNNING_MSG: &str = "gh6 crawl 未运行。启动：gh6 crawl &";
 
 async fn send_socket_command(
     cmd: &serde_json::Value,
@@ -178,6 +183,7 @@ async fn send_socket_command(
 async fn watch_socket(
     cmd: &serde_json::Value,
     json: bool,
+    progress: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)
@@ -190,6 +196,10 @@ async fn watch_socket(
 
     let mut reader = BufReader::new(&mut stream);
     let mut buffer = String::new();
+    let mut has_progress = false;
+
+    // Read initial status (first line after connect is the Ok response)
+    let mut current_status: Option<StatusData> = None;
 
     loop {
         buffer.clear();
@@ -205,23 +215,58 @@ async fn watch_socket(
                         if json {
                             println!("{}", serde_json::to_string(&resp)?);
                         } else {
-                            print_event(&resp);
+                            // Snapshot status from Ok responses
+                            if let ServerResponse::Ok { data: Some(data) } = &resp
+                                && let Ok(s) = serde_json::from_value::<StatusData>(data.clone())
+                            {
+                                current_status = Some(s);
+                            }
+
+                            // Erase previous progress line
+                            if progress && has_progress {
+                                eprint!("\x1b[1F\x1b[2K");
+                            }
+
+                            print_event(&resp, progress);
+
+                            // Reprint progress line at bottom
+                            if progress && let Some(ref s) = current_status {
+                                let p = progress_line(s);
+                                eprint!("{p}");
+                                has_progress = true;
+                            }
                         }
                         if matches!(resp, ServerResponse::Bye) {
                             break;
                         }
                     }
-                    Err(e) => eprintln!("{} Failed to parse: {e}", "⚠".yellow()),
+                    Err(e) => eprintln!("{} 解析失败: {e}", "⚠".yellow()),
                 }
             }
             Err(e) => {
-                eprintln!("{} Connection error: {e}", "⚠".yellow());
+                eprintln!("{} 连接错误: {e}", "⚠".yellow());
                 break;
             }
         }
     }
 
+    if has_progress {
+        eprintln!();
+    }
+
     Ok(())
+}
+
+fn progress_line(s: &StatusData) -> String {
+    let cc = s.currently_crawling.as_deref().unwrap_or("-");
+    format!(
+        "─── 已爬 {}  队列 {}  {}°  正在 {}  API {}/5000\n",
+        fmt_thousands(s.users_crawled),
+        fmt_thousands(s.users_queued),
+        s.current_degree,
+        cc,
+        s.api_remaining,
+    )
 }
 
 // ── Output Formatting ────────────────────────────────────────────────────────
@@ -288,7 +333,7 @@ fn print_status(data: &StatusData, json: bool) {
     );
 }
 
-fn print_event(resp: &ServerResponse) {
+fn print_event(resp: &ServerResponse, _has_progress: bool) {
     match resp {
         ServerResponse::Event { data } => match data {
             CrawlEvent::UserDone {
@@ -296,20 +341,20 @@ fn print_event(resp: &ServerResponse) {
                 degree,
                 new_connections,
             } => {
-                let s = format!("[{degree}°]");
-                let tag = s.cyan();
-                let check = "✓".green();
-                println!("{tag} {login} {check} {new_connections} new");
+                let tag = format!("[{degree}°]");
+                let tag = tag.cyan();
+                let done = "完成".green();
+                println!("{tag} {login}  {done}  新增 {new_connections} 连接");
             }
             CrawlEvent::UserQueued { login, degree } => {
-                let s = format!("[{degree}°]");
-                let tag = s.dimmed();
-                let q = "📥".dimmed();
-                println!("{tag} {login} {q}");
+                let tag = format!("[{degree}°]");
+                let tag = tag.dimmed();
+                let q = "入队".dimmed();
+                println!("{tag} {login}  {q}");
             }
         },
         ServerResponse::Bye => {
-            println!("{}", "👋 Server shutting down.".yellow());
+            println!("{}", "👋 服务器正在关闭".yellow());
         }
         _ => {}
     }
@@ -446,10 +491,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Crawl complete.");
         }
 
-        Command::Status { watch } => {
+        Command::Status { watch, progress } => {
             if watch {
                 let cmd = serde_json::json!({"cmd": "status", "watch": true});
-                watch_socket(&cmd, cli.json).await?;
+                watch_socket(&cmd, cli.json, progress).await?;
             } else {
                 let cmd = serde_json::json!({"cmd": "status"});
                 match send_socket_command(&cmd).await {
