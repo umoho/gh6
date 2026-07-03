@@ -32,17 +32,25 @@ pub enum GithubError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GithubApiUser {
     login: String,
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
     avatar_url: Option<String>,
+    #[serde(default)]
     company: Option<String>,
+    #[serde(default)]
     location: Option<String>,
+    #[serde(default)]
     followers: i64,
+    #[serde(default)]
     following: i64,
+    #[serde(default)]
     public_repos: i64,
+    #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
     updated_at: Option<String>,
 }
 
