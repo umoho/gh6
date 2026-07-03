@@ -20,7 +20,7 @@ mod types;
 
 use log::info;
 
-use crate::analyze::NeighborsResult;
+use crate::analyze::{FuzzyPathResult, NeighborsResult};
 use crate::db::Db;
 use crate::types::*;
 
@@ -487,6 +487,43 @@ fn print_stats(
     }
 }
 
+fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
+    if json {
+        let out: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(u, path)| {
+                serde_json::json!({
+                    "login": u.login,
+                    "path": path.iter().map(|p| &p.login).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&out).unwrap());
+        return;
+    }
+
+    for (i, (_user, path)) in results.iter().enumerate() {
+        let arrow = "→".dimmed();
+        let route: Vec<String> = path
+            .iter()
+            .enumerate()
+            .map(|(j, u)| {
+                if j == 0 {
+                    u.login.bold().to_string()
+                } else if j == path.len() - 1 {
+                    u.login.green().bold().to_string()
+                } else {
+                    u.login.to_string()
+                }
+            })
+            .collect();
+        let steps = path.len() - 1;
+        let s = format!("{:>2}.", i + 1);
+        let idx = s.dimmed();
+        println!("{idx} {} ({steps} 步)", route.join(&format!(" {arrow} ")));
+    }
+}
+
 fn print_export(users: usize, edges: usize, file: &str, json: bool) {
     if json {
         println!(
@@ -572,10 +609,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AnalyzeCommand::Path { user } => match analyze::cmd_path(&db, "umoho", &user)? {
                     Some(path) => print_path(&path, cli.json),
                     None => {
-                        if cli.json {
-                            println!("null");
+                        let matches = analyze::cmd_fuzzy_path(&db, "umoho", &user)?;
+                        if matches.is_empty() {
+                            if cli.json {
+                                println!("[]");
+                            } else {
+                                println!("未找到匹配 {} 的用户", user.dimmed());
+                            }
                         } else {
-                            println!("No path found from umoho to {user}");
+                            print_fuzzy_paths(&matches, cli.json);
                         }
                     }
                 },

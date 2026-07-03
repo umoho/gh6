@@ -51,6 +51,21 @@ pub fn cmd_path(db: &Db, from: &str, to: &str) -> Result<Option<Vec<User>>, Box<
     }
 }
 
+pub type FuzzyPathResult = Vec<(User, Vec<User>)>;
+
+/// Fuzzy search: find paths from seed to all users matching the query.
+pub fn cmd_fuzzy_path(db: &Db, from: &str, q: &str) -> Result<FuzzyPathResult, Box<dyn Error>> {
+    let matches = db.search_users(q)?;
+    let mut results = Vec::new();
+    for user in matches {
+        let path = db.get_shortest_path(from, &user.login)?;
+        if !path.is_empty() {
+            results.push((user, path));
+        }
+    }
+    Ok(results)
+}
+
 // ---------------------------------------------------------------------------
 // cmd_neighbors
 // ---------------------------------------------------------------------------

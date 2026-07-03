@@ -158,6 +158,35 @@ impl Db {
         Ok(count)
     }
 
+    /// Fuzzy-search users by login substring.
+    pub fn search_users(&self, q: &str) -> Result<Vec<User>, DbError> {
+        let pattern = format!("%{q}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, login, name, avatar_url, company, location, \
+             followers, following, public_repos, created_at, updated_at \
+             FROM users WHERE login LIKE ?1 ESCAPE '\\' \
+             ORDER BY CASE WHEN login LIKE ?2 THEN 0 ELSE 1 END, login \
+             LIMIT 20",
+        )?;
+        let prefix = format!("{q}%");
+        let rows = stmt.query_map(params![pattern, prefix], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                login: row.get(1)?,
+                name: row.get(2)?,
+                avatar_url: row.get(3)?,
+                company: row.get(4)?,
+                location: row.get(5)?,
+                followers: row.get(6)?,
+                following: row.get(7)?,
+                public_repos: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // -----------------------------------------------------------------------
     // Edge methods
     // -----------------------------------------------------------------------
