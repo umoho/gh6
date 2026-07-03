@@ -58,12 +58,6 @@ enum Command {
         #[command(subcommand)]
         sub: AnalyzeCommand,
     },
-
-    /// Show offline database statistics
-    Stats,
-
-    /// Export the graph to a JSON file
-    Export { file: String },
 }
 
 #[derive(Subcommand)]
@@ -74,6 +68,10 @@ enum AnalyzeCommand {
     Neighbors { user: String },
     /// Show distribution of users by BFS degree
     DegreeDist,
+    /// Show offline database overview
+    Stats,
+    /// Export the graph to a JSON file
+    Export { file: String },
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -602,51 +600,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let dist = analyze::cmd_degree_dist(&db)?;
                     print_degree_dist(&dist, cli.json);
                 }
+                AnalyzeCommand::Stats => {
+                    let total_users = db.get_user_count()? as u64;
+                    let crawled = db.get_crawled_count("follow_crawler")? as u64;
+                    let pending = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
+                    let dist = db.degree_distribution()?;
+                    let min_degree = dist.first().map(|d| d.degree).unwrap_or(0);
+                    let max_degree = dist.last().map(|d| d.degree).unwrap_or(0);
+
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let db_path = PathBuf::from(home).join(".local/share/gh6/gh6.db");
+                    let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "total_users": total_users,
+                                "crawled": crawled,
+                                "pending": pending,
+                                "min_degree": min_degree,
+                                "max_degree": max_degree,
+                                "file_size_bytes": file_size
+                            })
+                        );
+                    } else {
+                        print_stats(
+                            total_users,
+                            crawled,
+                            pending,
+                            min_degree,
+                            max_degree,
+                            file_size,
+                            &dist,
+                        );
+                    }
+                }
+                AnalyzeCommand::Export { file } => {
+                    let (users, edges) = analyze::cmd_export(&db, &file)?;
+                    print_export(users, edges, &file, cli.json);
+                }
             }
-        }
-
-        Command::Stats => {
-            let db = Db::open()?;
-            let total_users = db.get_user_count()? as u64;
-            let crawled = db.get_crawled_count("follow_crawler")? as u64;
-            let pending = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
-            let dist = db.degree_distribution()?;
-            let min_degree = dist.first().map(|d| d.degree).unwrap_or(0);
-            let max_degree = dist.last().map(|d| d.degree).unwrap_or(0);
-
-            let home = std::env::var("HOME").unwrap_or_default();
-            let db_path = PathBuf::from(home).join(".local/share/gh6/gh6.db");
-            let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "total_users": total_users,
-                        "crawled": crawled,
-                        "pending": pending,
-                        "min_degree": min_degree,
-                        "max_degree": max_degree,
-                        "file_size_bytes": file_size
-                    })
-                );
-            } else {
-                print_stats(
-                    total_users,
-                    crawled,
-                    pending,
-                    min_degree,
-                    max_degree,
-                    file_size,
-                    &dist,
-                );
-            }
-        }
-
-        Command::Export { file } => {
-            let db = Db::open()?;
-            let (users, edges) = analyze::cmd_export(&db, &file)?;
-            print_export(users, edges, &file, cli.json);
         }
     }
 
