@@ -81,6 +81,7 @@ impl Db {
 
         // Run migrations
         conn.execute_batch(MIGRATION_SQL)?;
+        conn.execute_batch(include_str!("../migrations/002_priority.sql"))?;
 
         Ok(Self { conn })
     }
@@ -330,9 +331,11 @@ impl Db {
     /// The scope_key is the user login string.
     pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT scope_key FROM crawl_state \
-             WHERE crawler_name = ?1 AND status = 'pending' \
-             ORDER BY scope_key \
+            "SELECT cs.scope_key FROM crawl_state cs \
+             JOIN users u ON u.login = cs.scope_key \
+             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
+             ORDER BY CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
+                      u.following ASC \
              LIMIT ?2",
         )?;
 
@@ -341,6 +344,20 @@ impl Db {
         })?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Set the priority of a crawl scope.
+    pub fn set_priority(
+        &self,
+        crawler_name: &str,
+        scope_key: &str,
+        priority: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE crawl_state SET priority = ?3 WHERE crawler_name = ?1 AND scope_key = ?2",
+            params![crawler_name, scope_key, priority],
+        )?;
+        Ok(())
     }
 
     /// Mark a crawler scope as done.

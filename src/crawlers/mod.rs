@@ -96,8 +96,7 @@ impl FollowCrawler {
                 db_guard.insert_edge(&edge)?;
                 new_edges.push(edge);
 
-                let already_crawled =
-                    db_guard.has_crawl_state(crawler_name, &gh_user.login)?;
+                let already_crawled = db_guard.has_crawl_state(crawler_name, &gh_user.login)?;
                 if !already_crawled {
                     db_guard.insert_pending_scope(crawler_name, &gh_user.login)?;
                 }
@@ -141,7 +140,6 @@ impl Crawler for FollowCrawler {
                 .unwrap_or(0)
         };
 
-        Self::crawl_following(self.name(), client, db, scope_key, current_degree)
-            .await
+        Self::crawl_following(self.name(), client, db, scope_key, current_degree).await
     }
 }

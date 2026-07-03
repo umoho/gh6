@@ -1,16 +1,19 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::crawlers::{Crawler, FollowCrawler};
 use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlEvent, ServerResponse, StatusData};
+
+/// Users with more following than this are deferred (priority = 'low').
+const HUB_FOLLOWING_THRESHOLD: i64 = 5000;
 
 // ── Shared state ──────────────────────────────────────────────────────────
 
@@ -191,6 +194,45 @@ async fn crawl_loop(
 
         *state.currently_crawling.write().await = Some(scope.clone());
 
+        // Lazily fetch user profile to learn the real following count.
+        let following_count = {
+            let db_guard = db.lock().await;
+            db_guard
+                .get_user_by_login(&scope)
+                .ok()
+                .flatten()
+                .map(|u| u.following)
+                .unwrap_or(0)
+        };
+
+        if following_count == 0 {
+            match client.get_user(&scope).await {
+                Ok(full_user) => {
+                    let count = full_user.following;
+                    let db_guard = db.lock().await;
+                    let _ = db_guard.upsert_user(&full_user);
+                    drop(db_guard);
+
+                    if count >= HUB_FOLLOWING_THRESHOLD {
+                        eprintln!("Deferring hub {scope} ({count} following)");
+                        let db_guard = db.lock().await;
+                        let _ = db_guard.set_priority(crawler_name, &scope, "low");
+                        drop(db_guard);
+                        *state.currently_crawling.write().await = None;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch profile for {scope}: {e}, skipping");
+                    let db_guard = db.lock().await;
+                    let _ = db_guard.mark_crawl_done(crawler_name, &scope);
+                    drop(db_guard);
+                    *state.currently_crawling.write().await = None;
+                    continue;
+                }
+            }
+        }
+
         let degree = {
             let db_guard = db.lock().await;
             match db_guard.get_user_by_login(&scope) {
@@ -211,8 +253,7 @@ async fn crawl_loop(
         eprintln!("Crawling: {scope} (degree {degree})");
 
         let result =
-            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree)
-                .await;
+            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree).await;
 
         match result {
             Ok(crawl_result) => {
