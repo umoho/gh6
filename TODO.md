@@ -1,0 +1,61 @@
+# TODO
+
+## 基础设施
+
+- [ ] 初始化 Rust 项目（Cargo.toml、依赖：tokio, rusqlite, reqwest, serde, serde_json, clap）
+- [ ] 项目目录结构搭建（src/main.rs, src/db.rs, src/github.rs, src/crawlers/, src/analyze.rs）
+- [ ] SQLite 数据库初始化（创建 `~/.local/share/gh6/`，migration：users, edges, crawl_state）
+- [ ] GitHub Token 获取（优先 `GITHUB_TOKEN` 环境变量，fallback `gh auth token`）
+
+## 通信层
+
+- [ ] Unix socket 监听模块（`gh6.sock`）
+- [ ] JSON Lines 协议：解析请求 / 构造响应
+- [ ] ServerState 共享状态（`Arc<RwLock<ServerState>>` + `AtomicBool`）
+- [ ] broadcast channel（watch 订阅推送）
+- [ ] 启动时检测已有实例（拒绝重复启动 / 清理残留 socket）
+- [ ] 优雅停止（完成当前 API 调用 + 落库后退出）
+
+## 爬虫核心
+
+- [ ] Crawler trait 定义
+- [ ] FollowCrawler 实现
+  - [ ] 获取用户 following 列表（`GET /users/{login}/following`）
+  - [ ] 分页处理（Link header）
+  - [ ] 写入 users 表
+  - [ ] 写入 edges 表（edge_type='follows'）
+  - [ ] 更新 crawl_state
+- [ ] BFS 主循环
+  - [ ] 从 crawl_state 取 pending scope（优先低度数）
+  - [ ] 调用爬虫
+  - [ ] 速率限制处理（检查 X-RateLimit-Remaining，sleep 到重置）
+  - [ ] 检查停止标志
+  - [ ] broadcast 推送事件
+- [ ] 种子用户初始化（umoho，degree=0）
+
+## CLI 命令
+
+- [ ] `gh6 crawl` — 启动爬虫后台
+  - [ ] PID 文件管理（可选）
+  - [ ] 打印初始状态信息
+- [ ] `gh6 status` — 连接 socket，请求并展示状态
+- [ ] `gh6 status --watch` — 持续接收事件流
+- [ ] `gh6 stop` — 连接 socket，发送停止命令
+- [ ] `gh6 analyze path <user>` — BFS 最短路径查询
+- [ ] `gh6 analyze neighbors <user>` — 直接连接查询
+- [ ] `gh6 analyze degree-dist` — 度数分布统计
+- [ ] `gh6 export <file>` — 导出图谱 JSON
+- [ ] 所有命令的 `--json` flag 支持
+
+## 输出格式化
+
+- [ ] 人类可读输出（表格、彩色终端）
+- [ ] JSON 输出模式（`--json` flag）
+- [ ] Watch 模式事件格式化输出
+
+## 健壮性
+
+- [ ] API 错误重试（429 / 5xx）
+- [ ] SQLite WAL 模式
+- [ ] Ctrl+C 优雅处理（signal handler）
+- [ ] 数据库迁移框架（简单版：version table）
