@@ -276,7 +276,7 @@ async fn crawl_loop(
                 }
 
                 info!(
-                    "  Done: {new_connections} new connections, {} users in following",
+                    "Done: {new_connections} new connections, {} users in following",
                     crawl_result.new_users.len()
                 );
             }
@@ -284,7 +284,7 @@ async fn crawl_loop(
                 error!("Error crawling {scope}: {e}");
                 let db_guard = db.lock().await;
                 if let Err(e2) = db_guard.mark_crawl_done(crawler_name, &scope) {
-                    error!("  Also failed to mark {scope} as done: {e2}");
+                    error!("Also failed to mark {scope} as done: {e2}");
                 }
             }
         }
