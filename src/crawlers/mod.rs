@@ -1,6 +1,5 @@
 //! Crawler trait and implementations for exploring the GitHub social graph.
 
-use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::db::Db;
@@ -22,7 +21,6 @@ pub enum CrawlerError {
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 /// Every crawler explores a different dimension of the GitHub social graph.
-#[async_trait(?Send)]
 pub trait Crawler {
     /// Unique name used as `crawler_name` in the `crawl_state` table.
     fn name(&self) -> &str;
@@ -118,7 +116,6 @@ impl FollowCrawler {
 
 // ── Trait implementation ──────────────────────────────────────────────────────
 
-#[async_trait(?Send)]
 impl Crawler for FollowCrawler {
     fn name(&self) -> &str {
         "follow_crawler"
