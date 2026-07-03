@@ -68,7 +68,7 @@ pub struct Edge {
     pub discovered_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DegreeDist {
     pub degree: i32,
     pub count: i64,
@@ -82,6 +82,44 @@ pub struct DegreeDist {
 pub struct CrawlResult {
     pub new_users: Vec<GithubUser>,
     pub new_edges: Vec<NewEdge>,
+}
+
+// ---------------------------------------------------------------------------
+// Server state & event types (shared between server and main)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusData {
+    pub users_crawled: u64,
+    pub users_queued: u64,
+    pub current_degree: i32,
+    pub api_remaining: u32,
+    pub api_reset_at: i64,
+    pub uptime_secs: u64,
+    pub currently_crawling: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerResponse {
+    Ok { data: Option<serde_json::Value> },
+    Error { msg: String },
+    Event { data: CrawlEvent },
+    Bye,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum CrawlEvent {
+    UserDone {
+        login: String,
+        degree: i32,
+        new_connections: usize,
+    },
+    UserQueued {
+        login: String,
+        degree: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------

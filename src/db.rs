@@ -403,6 +403,79 @@ impl Db {
         )?;
         Ok(count > 0)
     }
+
+    /// Look up a user by primary-key id.
+    pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, login, name, avatar_url, company, location, \
+             followers, following, public_repos, created_at, updated_at \
+             FROM users WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                login: row.get(1)?,
+                name: row.get(2)?,
+                avatar_url: row.get(3)?,
+                company: row.get(4)?,
+                location: row.get(5)?,
+                followers: row.get(6)?,
+                following: row.get(7)?,
+                public_repos: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        match rows.next() {
+            Some(result) => Ok(Some(result?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Return every user in the database.
+    pub fn get_all_users(&self) -> Result<Vec<User>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, login, name, avatar_url, company, location, \
+             followers, following, public_repos, created_at, updated_at \
+             FROM users",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                login: row.get(1)?,
+                name: row.get(2)?,
+                avatar_url: row.get(3)?,
+                company: row.get(4)?,
+                location: row.get(5)?,
+                followers: row.get(6)?,
+                following: row.get(7)?,
+                public_repos: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Return every edge in the database.
+    pub fn get_all_edges(&self) -> Result<Vec<Edge>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user_id, to_user_id, edge_type, weight, degree, metadata, discovered_at \
+             FROM edges",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Edge {
+                from_user_id: row.get(0)?,
+                to_user_id: row.get(1)?,
+                edge_type: row.get(2)?,
+                weight: row.get(3)?,
+                degree: row.get(4)?,
+                metadata: row.get(5)?,
+                discovered_at: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 // ---------------------------------------------------------------------------
