@@ -256,21 +256,26 @@ async fn watch_socket(
 
 fn progress_line(s: &StatusData) -> String {
     let cc = s.currently_crawling.as_deref().unwrap_or("-");
-    let api_str = format!("API {}/5000", s.api_remaining);
+    let api_val = format!("{}/5000", s.api_remaining);
     let api_colored = if s.api_remaining >= 1000 {
-        api_str.green().to_string()
+        api_val.green().to_string()
     } else if s.api_remaining >= 100 {
-        api_str.yellow().to_string()
+        api_val.yellow().to_string()
     } else {
-        api_str.red().to_string()
+        api_val.red().to_string()
     };
     format!(
-        "已爬 {}  队列 {}  {}°  正在 {}  {}  运行 {}\n",
+        "{} {}  {} {}  {}  {} {}  {} {}  {} {}\n",
+        "已爬".dimmed(),
         fmt_thousands(s.users_crawled).green(),
+        "队列".dimmed(),
         fmt_thousands(s.users_queued).dimmed(),
-        s.current_degree.to_string().cyan(),
+        format!("{}°", s.current_degree).cyan(),
+        "正在".dimmed(),
         cc.blue(),
+        "API".dimmed(),
         api_colored,
+        "运行".dimmed(),
         fmt_uptime(s.uptime_secs).dimmed(),
     )
 }
