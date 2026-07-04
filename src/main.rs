@@ -19,6 +19,26 @@ use gh6::analyze::{
 use gh6::db::Db;
 use gh6::types::*;
 
+// ── Table style helper ─────────────────────────────────────────────────────
+
+/// Apply the table style from `GH6_TABLE_STYLE` env var (default: `sharp`).
+macro_rules! with_table_style {
+    ($table:expr) => {{
+        let s = std::env::var("GH6_TABLE_STYLE").unwrap_or_else(|_| "sharp".to_string());
+        match s.as_str() {
+            "empty" => $table.with(Style::empty()),
+            "blank" => $table.with(Style::blank()),
+            "ascii" => $table.with(Style::ascii()),
+            "psql" => $table.with(Style::psql()),
+            "markdown" => $table.with(Style::markdown()),
+            "modern" => $table.with(Style::modern()),
+            "rounded" => $table.with(Style::rounded()),
+            "extended" => $table.with(Style::extended()),
+            _ => $table.with(Style::sharp()),
+        }
+    }};
+}
+
 // ── CLI Definition ───────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -811,24 +831,48 @@ fn print_suggest(result: &SuggestResult, json: bool, reason: bool) {
 
     let max_weight = result.suggestions.first().map(|s| s.weight).unwrap_or(1.0);
 
-    for (i, s) in result.suggestions.iter().enumerate() {
-        let label = format!("#{}", i + 1);
-        let idx = label.dimmed();
-        let bar_len = if max_weight > 0.0 {
-            (s.weight / max_weight * 20.0) as usize
-        } else {
-            0
-        };
-        let bar = "█".repeat(bar_len);
-        let bar_str = bar.dimmed();
-        println!("  {idx:>4}  {}  {bar_str} 权重 {:.2}", s.login, s.weight);
-
-        if reason && !s.mutual_friends.is_empty() {
-            let friends = s.mutual_friends.join(", ");
-            println!("        └─ {} 都关注了 ta", friends.dimmed());
-        }
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "#")]
+        rank: String,
+        login: String,
+        #[tabled(rename = "权重")]
+        weight: String,
     }
-    println!();
+
+    let rows: Vec<Row> = result
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let bar_len = if max_weight > 0.0 {
+                (s.weight / max_weight * 10.0) as usize
+            } else {
+                0
+            };
+            let bar = "█".repeat(bar_len);
+            Row {
+                rank: format!("#{}", i + 1),
+                login: s.login.clone(),
+                weight: format!("{} {:.2}", bar, s.weight),
+            }
+        })
+        .collect();
+
+    let mut table = Table::new(rows);
+    with_table_style!(table);
+    println!("{table}");
+
+    if reason {
+        for s in &result.suggestions {
+            if !s.mutual_friends.is_empty() {
+                let friends = s.mutual_friends.join(", ");
+                println!("  {} ── {}", s.login.dimmed(), friends.dimmed());
+            }
+        }
+        println!();
+    }
+
     println!(
         "（基于 {} 个关注者，覆盖 {} 个候选）",
         result.based_on.to_string().dimmed(),
@@ -851,18 +895,38 @@ fn print_bridges(result: &BridgesResult, json: bool) {
     println!("（隐藏后连通分量从 {} 增加）", result.baseline_components);
     println!();
 
-    for (i, b) in result.bridges.iter().enumerate() {
-        let label = format!("#{}", i + 1);
-        let idx = label.dimmed();
-        let f = |n: i64| fmt_thousands(n as u64);
-        println!(
-            "  {idx:>3}  {}           关注 {}  粉丝 {}  关键性 +{}",
-            b.login,
-            f(b.following),
-            f(b.followers),
-            b.impact
-        );
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "#")]
+        rank: String,
+        login: String,
+        #[tabled(rename = "关注")]
+        following: String,
+        #[tabled(rename = "粉丝")]
+        followers: String,
+        #[tabled(rename = "关键性")]
+        impact: String,
     }
+
+    let rows: Vec<Row> = result
+        .bridges
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let f = |n: i64| fmt_thousands(n as u64);
+            Row {
+                rank: format!("#{}", i + 1),
+                login: b.login.clone(),
+                following: f(b.following),
+                followers: f(b.followers),
+                impact: format!("+{}", b.impact),
+            }
+        })
+        .collect();
+
+    let mut table = Table::new(rows);
+    with_table_style!(table);
+    println!("{table}");
 }
 
 fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool, with_profile: bool, with_stats: bool) {
@@ -1078,16 +1142,30 @@ fn print_communities(result: &CommunitiesResult, json: bool) {
     println!("共 {} 个社区", result.num_communities);
     println!();
 
-    for (i, c) in result.communities.iter().enumerate() {
-        let label = format!("#{}", i + 1);
-        let idx = label.dimmed();
-        let size = fmt_thousands(c.size as u64);
-        println!("  {idx:>3}  {size} 人");
-        if !c.representatives.is_empty() {
-            let reps = c.representatives.join(", ");
-            println!("       代表: {reps}");
-        }
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "#")]
+        rank: String,
+        #[tabled(rename = "人数")]
+        size: String,
+        #[tabled(rename = "代表")]
+        reps: String,
     }
+
+    let rows: Vec<Row> = result
+        .communities
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Row {
+            rank: format!("#{}", i + 1),
+            size: fmt_thousands(c.size as u64),
+            reps: c.representatives.join(", "),
+        })
+        .collect();
+
+    let mut table = Table::new(rows);
+    with_table_style!(table);
+    println!("{table}");
 }
 
 fn print_export(users: usize, edges: usize, file: &str, json: bool) {
