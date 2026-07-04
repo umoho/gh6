@@ -664,7 +664,7 @@ fn print_user(result: &UserProfileResult, json: bool) {
             println!("  {c} {label}{value}");
         }
     } else {
-        println!("  └ {NA}");
+        println!("  └ {}", NA.yellow());
     }
     println!();
 
@@ -689,7 +689,7 @@ fn print_user(result: &UserProfileResult, json: bool) {
             println!("  {c} {label}{value}");
         }
     } else {
-        println!("  └ {NA}");
+        println!("  └ {}", NA.yellow());
     }
     println!();
 
@@ -785,7 +785,15 @@ fn print_stats(s: &StatsResult, json: bool) {
     println!("{}", "图统计".bold());
     println!("{}", "──────".dimmed());
     println!("  边数             {}", fmt_thousands(s.total_edges));
-    println!("  图密度           {:.6}", s.density);
+    let density_str = format!("{:.6}", s.density);
+    let density_colored = if s.density > 0.001 {
+        density_str.green().to_string()
+    } else if s.density > 0.0001 {
+        density_str.yellow().to_string()
+    } else {
+        density_str.red().to_string()
+    };
+    println!("  图密度           {density_colored}");
     println!(
         "  连通分量数       {}",
         fmt_thousands(s.connected_components as u64)
@@ -853,10 +861,10 @@ fn print_suggest(result: &SuggestResult, json: bool, reason: bool) {
                 } else {
                     0
                 };
-                let bar = "█".repeat(bar_len);
+                let bar = weight_bar(bar_len, 10);
                 Row {
                     rank: format!("#{}", i + 1),
-                    login: s.login.clone(),
+                    login: s.login.blue().to_string(),
                     weight: format!("{} {:.2}", bar, s.weight),
                     friends: s.mutual_friends.join(", "),
                 }
@@ -886,10 +894,10 @@ fn print_suggest(result: &SuggestResult, json: bool, reason: bool) {
                 } else {
                     0
                 };
-                let bar = "█".repeat(bar_len);
+                let bar = weight_bar(bar_len, 10);
                 Row {
                     rank: format!("#{}", i + 1),
-                    login: s.login.clone(),
+                    login: s.login.blue().to_string(),
                     weight: format!("{} {:.2}", bar, s.weight),
                 }
             })
@@ -944,10 +952,19 @@ fn print_bridges(result: &BridgesResult, json: bool) {
             let f = |n: i64| fmt_thousands(n as u64);
             Row {
                 rank: format!("#{}", i + 1),
-                login: b.login.clone(),
+                login: b.login.blue().to_string(),
                 following: f(b.following),
                 followers: f(b.followers),
-                impact: format!("+{}", b.impact),
+                impact: {
+                    let s = format!("+{}", b.impact);
+                    if b.impact >= 1000 {
+                        s.red().to_string()
+                    } else if b.impact >= 100 {
+                        s.yellow().to_string()
+                    } else {
+                        s
+                    }
+                },
             }
         })
         .collect();
@@ -1052,6 +1069,38 @@ fn user_detail_line(u: &User) -> String {
         parts.push(company);
     }
     parts.join(" · ")
+}
+
+/// Build a gradient-coloured weight bar.
+fn weight_bar(width: usize, max_width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut s = String::new();
+    for i in 0..width {
+        let ratio = i as f32 / max_width.max(1) as f32;
+        let ch = if ratio < 0.33 {
+            "█".green().to_string()
+        } else if ratio < 0.66 {
+            "█".yellow().to_string()
+        } else {
+            "█".red().to_string()
+        };
+        s.push_str(&ch);
+    }
+    s
+}
+
+/// Colour a modularity score by quality.
+fn colour_q(q: f64) -> String {
+    let s = format!("{q:.4}");
+    if q > 0.5 {
+        s.green().to_string()
+    } else if q > 0.3 {
+        s.yellow().to_string()
+    } else {
+        s.dimmed().to_string()
+    }
 }
 
 fn print_all_paths(paths: &AllPathsResult, json: bool, with_profile: bool, with_stats: bool) {
@@ -1165,8 +1214,9 @@ fn print_communities(result: &CommunitiesResult, json: bool, limit: usize) {
     }
 
     println!(
-        "🏘️ 社区发现  ({} 算法, 模块度 Q={:.4})",
-        result.algorithm, result.modularity
+        "🏘️ 社区发现  ({} 算法, 模块度 Q={})",
+        result.algorithm,
+        colour_q(result.modularity)
     );
     println!("共 {} 个社区", result.num_communities);
     println!();
