@@ -13,7 +13,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 usage() {
-    echo "Usage: $0 install | uninstall"
+    echo "Usage: $0 [uninstall]"
     exit 1
 }
 
@@ -54,7 +54,7 @@ uninstall() {
     echo -e "${GREEN}✓${NC} Uninstalled."
 }
 
-case "${1:-}" in
+case "${1:-install}" in
     install) install ;;
     uninstall) uninstall ;;
     *) usage ;;
