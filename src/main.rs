@@ -112,7 +112,7 @@ fn fmt_uptime(secs: u64) -> String {
 
 fn fmt_reset(ts: i64) -> String {
     if ts == 0 {
-        return "(unknown)".into();
+        return "(未知)".into();
     }
     let local = Local
         .timestamp_opt(ts, 0)
@@ -148,8 +148,7 @@ fn bar(width: u64, max: u64, bar_width: usize) -> String {
 
 // ── Socket Client ────────────────────────────────────────────────────────────
 
-const NOT_RUNNING_MSG: &str =
-    "gh6d daemon is not running. Start it with: systemctl --user start gh6d";
+const NOT_RUNNING_MSG: &str = "gh6d 守护进程未运行。启动：systemctl --user start gh6d";
 
 async fn send_socket_command(
     cmd: &serde_json::Value,
@@ -337,7 +336,7 @@ fn print_status(data: &StatusData, json: bool) {
     let currently = data
         .currently_crawling
         .as_deref()
-        .unwrap_or("(idle)")
+        .unwrap_or("(空闲)")
         .to_string();
 
     let state_str = if data.paused {
@@ -440,7 +439,7 @@ fn print_path(path: &[User], json: bool) {
     let arrow = "→".dimmed();
     let steps = path.len() - 1;
     println!("{}", route.join(&format!(" {arrow} ")));
-    println!("({steps} step{})", if steps == 1 { "" } else { "s" });
+    println!("({steps} 步)");
 }
 
 fn print_neighbors(result: &NeighborsResult, json: bool) {
@@ -656,7 +655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
                         println!("{} {msg}", "▶".green());
                     } else {
-                        println!("{} Crawl started.", "▶".green());
+                        println!("{} 爬取已启动。", "▶".green());
                     }
                 }
                 Ok(ServerResponse::Error { msg }) => {
@@ -664,7 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 Ok(_) => {
-                    eprintln!("{} Unexpected server response", "?".yellow());
+                    eprintln!("{} 意外的服务器响应", "?".yellow());
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -681,7 +680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
                         println!("{} {msg}", "⏸".yellow());
                     } else {
-                        println!("{} Crawl paused.", "⏸".yellow());
+                        println!("{} 爬取已暂停。", "⏸".yellow());
                     }
                 }
                 Ok(ServerResponse::Error { msg }) => {
@@ -689,7 +688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 Ok(_) => {
-                    eprintln!("{} Unexpected server response", "?".yellow());
+                    eprintln!("{} 意外的服务器响应", "?".yellow());
                     std::process::exit(1);
                 }
                 Err(e) => {
@@ -718,7 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if cli.json {
                             println!("{}", serde_json::to_string(&other)?);
                         } else {
-                            eprintln!("{} Unexpected: {other:?}", "?".yellow());
+                            eprintln!("{} 意外响应: {other:?}", "?".yellow());
                         }
                     }
                     Err(e) => {
