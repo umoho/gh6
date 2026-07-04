@@ -831,48 +831,76 @@ fn print_suggest(result: &SuggestResult, json: bool, reason: bool) {
 
     let max_weight = result.suggestions.first().map(|s| s.weight).unwrap_or(1.0);
 
-    #[derive(Tabled)]
-    struct Row {
-        #[tabled(rename = "#")]
-        rank: String,
-        login: String,
-        #[tabled(rename = "权重")]
-        weight: String,
-    }
-
-    let rows: Vec<Row> = result
-        .suggestions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let bar_len = if max_weight > 0.0 {
-                (s.weight / max_weight * 10.0) as usize
-            } else {
-                0
-            };
-            let bar = "█".repeat(bar_len);
-            Row {
-                rank: format!("#{}", i + 1),
-                login: s.login.clone(),
-                weight: format!("{} {:.2}", bar, s.weight),
-            }
-        })
-        .collect();
-
-    let mut table = Table::new(rows);
-    with_table_style!(table);
-    println!("{table}");
-
     if reason {
-        for s in &result.suggestions {
-            if !s.mutual_friends.is_empty() {
-                let friends = s.mutual_friends.join(", ");
-                println!("  {} ── {}", s.login.dimmed(), friends.dimmed());
-            }
+        #[derive(Tabled)]
+        struct Row {
+            #[tabled(rename = "#")]
+            rank: String,
+            login: String,
+            #[tabled(rename = "权重")]
+            weight: String,
+            #[tabled(rename = "也关注了 ta")]
+            friends: String,
         }
-        println!();
+
+        let rows: Vec<Row> = result
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let bar_len = if max_weight > 0.0 {
+                    (s.weight / max_weight * 10.0) as usize
+                } else {
+                    0
+                };
+                let bar = "█".repeat(bar_len);
+                Row {
+                    rank: format!("#{}", i + 1),
+                    login: s.login.clone(),
+                    weight: format!("{} {:.2}", bar, s.weight),
+                    friends: s.mutual_friends.join(", "),
+                }
+            })
+            .collect();
+
+        let mut table = Table::new(rows);
+        with_table_style!(table);
+        println!("{table}");
+    } else {
+        #[derive(Tabled)]
+        struct Row {
+            #[tabled(rename = "#")]
+            rank: String,
+            login: String,
+            #[tabled(rename = "权重")]
+            weight: String,
+        }
+
+        let rows: Vec<Row> = result
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let bar_len = if max_weight > 0.0 {
+                    (s.weight / max_weight * 10.0) as usize
+                } else {
+                    0
+                };
+                let bar = "█".repeat(bar_len);
+                Row {
+                    rank: format!("#{}", i + 1),
+                    login: s.login.clone(),
+                    weight: format!("{} {:.2}", bar, s.weight),
+                }
+            })
+            .collect();
+
+        let mut table = Table::new(rows);
+        with_table_style!(table);
+        println!("{table}");
     }
 
+    println!();
     println!(
         "（基于 {} 个关注者，覆盖 {} 个候选）",
         result.based_on.to_string().dimmed(),
