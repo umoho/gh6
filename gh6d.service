@@ -1,0 +1,18 @@
+[Unit]
+Description=gh6 GitHub Social Graph Explorer Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/gh6d
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Uncomment to use SIGINT instead of SIGTERM for graceful shutdown:
+# KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

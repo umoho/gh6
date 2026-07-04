@@ -99,6 +99,7 @@ pub struct StatusData {
     pub api_reset_at: i64,
     pub uptime_secs: u64,
     pub currently_crawling: Option<String>,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

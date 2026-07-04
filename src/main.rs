@@ -12,18 +12,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
-mod analyze;
-mod crawlers;
-mod db;
-mod github;
-mod server;
-mod types;
-
-use log::info;
-
-use crate::analyze::{AllPathsResult, FuzzyPathResult, NeighborsResult};
-use crate::db::Db;
-use crate::types::*;
+use gh6::analyze::{self, AllPathsResult, FuzzyPathResult, NeighborsResult};
+use gh6::db::Db;
+use gh6::types::*;
 
 // ── CLI Definition ───────────────────────────────────────────────────────────
 
@@ -39,8 +30,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the crawl server (blocks until graceful shutdown)
-    Crawl,
+    /// Start or resume crawling
+    Run,
+
+    /// Pause the crawl (daemon stays alive)
+    Pause,
 
     /// Show crawl progress or watch real-time updates
     Status {
@@ -52,9 +46,6 @@ enum Command {
         #[arg(long)]
         progress: bool,
     },
-
-    /// Gracefully stop the running crawl server
-    Stop,
 
     /// Analyze the collected social graph
     Analyze {
@@ -157,7 +148,8 @@ fn bar(width: u64, max: u64, bar_width: usize) -> String {
 
 // ── Socket Client ────────────────────────────────────────────────────────────
 
-const NOT_RUNNING_MSG: &str = "gh6 crawl 未运行。启动：gh6 crawl &";
+const NOT_RUNNING_MSG: &str =
+    "gh6d daemon is not running. Start it with: systemctl --user start gh6d";
 
 async fn send_socket_command(
     cmd: &serde_json::Value,
@@ -256,6 +248,13 @@ async fn watch_socket(
 }
 
 fn progress_line(s: &StatusData) -> String {
+    if s.paused {
+        return format!(
+            "{} 队列 {}  等待 'gh6 run' …\n",
+            "⏸".yellow(),
+            fmt_thousands(s.users_queued).dimmed()
+        );
+    }
     let cc = s.currently_crawling.as_deref().unwrap_or("-");
     let api_val = format!("{}/5000", s.api_remaining);
 
@@ -341,7 +340,17 @@ fn print_status(data: &StatusData, json: bool) {
         .unwrap_or("(idle)")
         .to_string();
 
+    let state_str = if data.paused {
+        "⏸ 已暂停".to_string()
+    } else {
+        "▶ 运行中".to_string()
+    };
+
     let rows = vec![
+        StatusRow {
+            label: "服务状态".into(),
+            value: state_str,
+        },
         StatusRow {
             label: "已爬".into(),
             value: fmt_thousands(data.users_crawled),
@@ -372,7 +381,7 @@ fn print_status(data: &StatusData, json: bool) {
         },
     ];
 
-    let title = format!("⏳ gh6 crawl · {}", fmt_uptime(data.uptime_secs).dimmed());
+    let title = format!("⏳ gh6 · {}", fmt_uptime(data.uptime_secs).dimmed());
     println!("{}", title);
     println!(
         "{}",
@@ -640,13 +649,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Crawl => {
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-                .format_timestamp_secs()
-                .init();
-            info!("Starting gh6 crawl server…");
-            server::run_crawl_server().await?;
-            info!("Crawl complete.");
+        Command::Run => {
+            let cmd = serde_json::json!({"cmd": "start"});
+            match send_socket_command(&cmd).await {
+                Ok(ServerResponse::Ok { data: Some(data) }) => {
+                    if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
+                        println!("{} {msg}", "▶".green());
+                    } else {
+                        println!("{} Crawl started.", "▶".green());
+                    }
+                }
+                Ok(ServerResponse::Error { msg }) => {
+                    eprintln!("{} {msg}", "✗".red());
+                    std::process::exit(1);
+                }
+                Ok(_) => {
+                    eprintln!("{} Unexpected server response", "?".yellow());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "✗".red());
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Command::Pause => {
+            let cmd = serde_json::json!({"cmd": "pause"});
+            match send_socket_command(&cmd).await {
+                Ok(ServerResponse::Ok { data: Some(data) }) => {
+                    if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
+                        println!("{} {msg}", "⏸".yellow());
+                    } else {
+                        println!("{} Crawl paused.", "⏸".yellow());
+                    }
+                }
+                Ok(ServerResponse::Error { msg }) => {
+                    eprintln!("{} {msg}", "✗".red());
+                    std::process::exit(1);
+                }
+                Ok(_) => {
+                    eprintln!("{} Unexpected server response", "?".yellow());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "✗".red());
+                    std::process::exit(1);
+                }
+            }
         }
 
         Command::Status { watch, progress } => {
@@ -676,22 +726,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     }
                 }
-            }
-        }
-
-        Command::Stop => {
-            let cmd = serde_json::json!({"cmd": "stop"});
-            match send_socket_command(&cmd).await {
-                Ok(ServerResponse::Ok { .. }) => {
-                    println!("{} Stop signal sent.", "🛑".green());
-                }
-                Ok(ServerResponse::Error { msg }) => {
-                    eprintln!("{} {msg}", "✗".red());
-                }
-                Ok(ServerResponse::Bye) => {
-                    println!("{} Server is shutting down.", "👋".yellow());
-                }
-                _ => {}
             }
         }
 

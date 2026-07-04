@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::crawlers::{Crawler, FollowCrawler};
@@ -26,6 +27,7 @@ struct ServerState {
     api_reset_at: AtomicI64,
     started_at: Instant,
     shutdown: AtomicBool,
+    paused: AtomicBool,
     event_tx: broadcast::Sender<CrawlEvent>,
 }
 
@@ -38,6 +40,7 @@ impl ServerState {
             api_reset_at: AtomicI64::new(0),
             started_at: Instant::now(),
             shutdown: AtomicBool::new(false),
+            paused: AtomicBool::new(true),
             event_tx,
         }
     }
@@ -45,8 +48,9 @@ impl ServerState {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Start the crawl server: open db, seed, spawn crawl loop, listen on Unix socket.
-pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
+/// Start the daemon: open db, seed, spawn crawl loop (starts paused),
+/// listen on Unix socket, handle SIGTERM/SIGINT for graceful shutdown.
+pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let crawler = FollowCrawler::new();
     let crawler_name = crawler.name().to_string();
 
@@ -119,10 +123,27 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
     }
 
-    // 6. Channel to signal crawl-loop completion
+    // 6. Register signal handler for graceful shutdown
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            info!("Received shutdown signal, stopping…");
+            state.shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+
+    // 7. Channel to signal crawl-loop completion
     let (crawl_done_tx, mut crawl_done_rx) = tokio::sync::oneshot::channel();
 
-    // 7. Spawn the crawl loop
+    // 8. Spawn the crawl loop (starts in paused state, waits for 'gh6 run')
     let crawl_state = state.clone();
     let crawl_db = db.clone();
     let cn = crawler_name.clone();
@@ -131,7 +152,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
         let _ = crawl_done_tx.send(());
     });
 
-    // 8. Accept client connections
+    // 9. Accept client connections
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -158,7 +179,7 @@ pub async fn run_crawl_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 9. Cleanup
+    // 10. Cleanup
     let _ = std::fs::remove_file(&socket_path);
     let db_guard = db.lock().await;
     match db_guard.get_user_count() {
@@ -183,13 +204,23 @@ async fn crawl_loop(
             break;
         }
 
+        // Wait while paused (idle or explicitly paused by user)
+        while state.paused.load(Ordering::SeqCst) {
+            if state.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
         let scope = {
             let db_guard = db.lock().await;
             match db_guard.pending_scopes(crawler_name, 1) {
                 Ok(scopes) if !scopes.is_empty() => scopes.into_iter().next().unwrap(),
                 Ok(_) => {
+                    // Queue empty — auto-pause and wait
+                    state.paused.store(true, Ordering::SeqCst);
                     drop(db_guard);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 Err(e) => {
@@ -317,7 +348,14 @@ async fn crawl_loop(
                     "Rate limit low ({} remaining), sleeping {wait}s…",
                     rl.remaining
                 );
-                tokio::time::sleep(Duration::from_secs(wait)).await;
+                // Interruptible sleep — check shutdown/paused every second
+                for _ in 0..wait {
+                    if state.shutdown.load(Ordering::SeqCst) || state.paused.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
@@ -353,13 +391,29 @@ async fn handle_client(
                 handle_status_once(writer, state, db, crawler_name).await?;
             }
         }
-        "stop" => {
-            let already_stopping = state.shutdown.swap(true, Ordering::SeqCst);
-            let msg = if already_stopping {
-                "already stopping"
+        "start" => {
+            let was_paused = state.paused.swap(false, Ordering::SeqCst);
+            let msg = if was_paused {
+                "started"
             } else {
-                "stopping"
+                "already running"
             };
+            info!("Crawl {msg}");
+            let response = ServerResponse::Ok {
+                data: Some(serde_json::json!({ "msg": msg })),
+            };
+            let json = serde_json::to_string(&response)? + "\n";
+            let mut writer = writer;
+            writer.write_all(json.as_bytes()).await?;
+        }
+        "pause" => {
+            let was_running = !state.paused.swap(true, Ordering::SeqCst);
+            let msg = if was_running {
+                "paused"
+            } else {
+                "already paused"
+            };
+            info!("Crawl {msg}");
             let response = ServerResponse::Ok {
                 data: Some(serde_json::json!({ "msg": msg })),
             };
@@ -479,6 +533,7 @@ fn build_status_data(
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
     let api_reset_at = state.api_reset_at.load(Ordering::SeqCst);
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let paused = state.paused.load(Ordering::SeqCst);
 
     Ok(StatusData {
         users_crawled,
@@ -488,5 +543,6 @@ fn build_status_data(
         api_reset_at,
         uptime_secs,
         currently_crawling,
+        paused,
     })
 }
