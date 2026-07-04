@@ -10,6 +10,7 @@ use tabled::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use unicode_width::UnicodeWidthStr;
 
 mod analyze;
 mod crawlers;
@@ -257,6 +258,36 @@ async fn watch_socket(
 fn progress_line(s: &StatusData) -> String {
     let cc = s.currently_crawling.as_deref().unwrap_or("-");
     let api_val = format!("{}/5000", s.api_remaining);
+
+    // Compute plain-text widths for padding (before colorizing)
+    let deg = format!("{}°", s.current_degree);
+    let left_plain = format!(
+        "{} {}  {} {}  {}  {} {}",
+        "已爬",
+        fmt_thousands(s.users_crawled),
+        "队列",
+        fmt_thousands(s.users_queued),
+        deg,
+        "正在",
+        cc,
+    );
+    let right_plain = format!(
+        "{} {}  {} {}",
+        "运行",
+        fmt_uptime(s.uptime_secs),
+        "API",
+        api_val,
+    );
+
+    let left_w = left_plain.width();
+    let right_w = right_plain.width();
+    let term_w = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80) as usize;
+    let pad = term_w.saturating_sub(left_w + right_w).max(1);
+
+    // Colorize
     let api_colored = if s.api_remaining >= 1000 {
         api_val.green().to_string()
     } else if s.api_remaining >= 100 {
@@ -264,20 +295,27 @@ fn progress_line(s: &StatusData) -> String {
     } else {
         api_val.red().to_string()
     };
-    format!(
-        "{} {}  {} {}  {}  {} {}  {} {}  {} {}\n",
+
+    let left = format!(
+        "{} {}  {} {}  {}  {} {}",
         "已爬".dimmed(),
         fmt_thousands(s.users_crawled).green(),
         "队列".dimmed(),
         fmt_thousands(s.users_queued).dimmed(),
-        format!("{}°", s.current_degree).cyan(),
+        deg.cyan(),
         "正在".dimmed(),
         cc.blue(),
-        "API".dimmed(),
-        api_colored,
+    );
+
+    let right = format!(
+        "{} {}  {} {}",
         "运行".dimmed(),
         fmt_uptime(s.uptime_secs).dimmed(),
-    )
+        "API".dimmed(),
+        api_colored,
+    );
+
+    format!("{left}{}{right}\n", " ".repeat(pad))
 }
 
 // ── Output Formatting ────────────────────────────────────────────────────────
