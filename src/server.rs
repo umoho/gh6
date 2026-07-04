@@ -394,9 +394,9 @@ async fn handle_client(
         "start" => {
             let was_paused = state.paused.swap(false, Ordering::SeqCst);
             let msg = if was_paused {
-                "已启动"
+                "started"
             } else {
-                "已在运行"
+                "already running"
             };
             info!("Crawl {msg}");
             let response = ServerResponse::Ok {
@@ -409,9 +409,9 @@ async fn handle_client(
         "pause" => {
             let was_running = !state.paused.swap(true, Ordering::SeqCst);
             let msg = if was_running {
-                "已暂停"
+                "paused"
             } else {
-                "已在暂停"
+                "already paused"
             };
             info!("Crawl {msg}");
             let response = ServerResponse::Ok {

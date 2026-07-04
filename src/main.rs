@@ -150,6 +150,16 @@ fn bar(width: u64, max: u64, bar_width: usize) -> String {
 
 const NOT_RUNNING_MSG: &str = "gh6d 守护进程未运行。";
 
+fn translate_msg(msg: &str) -> &str {
+    match msg {
+        "started" => "已启动",
+        "already running" => "已在运行",
+        "paused" => "已暂停",
+        "already paused" => "已在暂停",
+        _ => msg,
+    }
+}
+
 async fn send_socket_command(
     cmd: &serde_json::Value,
 ) -> Result<ServerResponse, Box<dyn std::error::Error>> {
@@ -653,7 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match send_socket_command(&cmd).await {
                 Ok(ServerResponse::Ok { data: Some(data) }) => {
                     if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
-                        println!("{} {msg}", "▶".green());
+                        println!("{} {}", "▶".green(), translate_msg(msg));
                     } else {
                         println!("{} 爬取已启动。", "▶".green());
                     }
@@ -678,7 +688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match send_socket_command(&cmd).await {
                 Ok(ServerResponse::Ok { data: Some(data) }) => {
                     if let Some(msg) = data.get("msg").and_then(|m| m.as_str()) {
-                        println!("{} {msg}", "⏸".yellow());
+                        println!("{} {}", "⏸".yellow(), translate_msg(msg));
                     } else {
                         println!("{} 爬取已暂停。", "⏸".yellow());
                     }
