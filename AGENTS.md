@@ -1,8 +1,17 @@
 # AGENTS.md
 
+## 提交前检查
+
+修改 Rust 代码后，提交前请确保：
+
+- **clippy** — `cargo clippy --all-targets` 无 warning
+- **rustfmt** — 代码已格式化（`cargo fmt`）
+
+具体工具不限，也可以借助编辑器插件或 pre-commit hook 自动完成。
+
 ## Commit 风格
 
-采用 Conventional Commits 格式：
+采用 Conventional Commits 格式，提交消息使用英文：
 
 ```
 <type>(<scope>): <message>
@@ -49,3 +58,80 @@ docs: add DESIGN.md and TODO.md
 - `cargo fmt` 和 `cargo clippy` 通过后再提交
 - 异步代码使用 `tokio`
 - 错误处理使用 `thiserror` 定义错误类型，不用 `anyhow`
+
+## 代码规范 — 文档注释
+
+文档注释使用英文。
+
+### Module
+
+```rust
+//! Module description.
+//!
+//! Detailed description (optional).
+//!
+//! # Submodules
+//!
+//! * `mod1` - description
+//!
+//! # Types
+//!
+//! * [`Type1`] - description
+```
+
+### Struct
+
+```rust
+/// Short description.
+///
+/// Detailed description (optional).
+pub struct Example {
+    /// Field description.
+    pub field: Type,
+}
+```
+
+### Enum
+
+```rust
+/// Short description.
+pub enum Example {
+    /// Variant description.
+    Variant1,
+
+    /// Variant description.
+    Variant2 {
+        /// Field description.
+        field: Type,
+    },
+}
+```
+
+### Function / Method
+
+```rust
+/// Short description.
+///
+/// Detailed description (optional).
+///
+/// # Arguments
+///
+/// * `param` - description (unit, range if applicable)
+///
+/// # Returns
+///
+/// Description.
+///
+/// # Panics
+///
+/// Conditions that may cause a panic.
+pub fn example(param: Type) -> ReturnType {}
+```
+
+### Const
+
+```rust
+/// Description.
+const NAME: Type = value;
+```
+
