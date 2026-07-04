@@ -7,12 +7,22 @@
     <string>com.gh6.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/umoho/.cargo/bin/gh6d</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>
+            export PATH=&quot;$PATH:/opt/homebrew/bin:/usr/local/bin&quot;
+            if [ -z &quot;$GITHUB_TOKEN&quot; ]; then
+                export GITHUB_TOKEN=$(gh auth token 2&gt;/dev/null)
+            fi
+            exec /Users/umoho/.cargo/bin/gh6d
+        </string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>/Users/umoho/.local/share/gh6/gh6d.log</string>
     <key>StandardErrorPath</key>
