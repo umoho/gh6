@@ -6,27 +6,33 @@
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                       gh6 (Rust)                         │
+│              gh6d (守护) + gh6 (客户端)                    │
 │                                                          │
 │  ┌─────────────┐         ┌─────────────────────────────┐ │
-│  │  gh6 crawl  │ ──写入──→  ~/.local/share/gh6/gh6.db  │ │
-│  │  (后台爬虫)  │         │        SQLite               │ │
-│  └──────┬──────┘         └──────────────┬──────────────┘ │
-│         │   Unix socket                 │  直读           │
+│  │    gh6d     │ ──写入──→  ~/.local/share/gh6/gh6.db  │ │
+│  │  (launchd / │         │        SQLite               │ │
+│  │   systemd)  │         └──────────────┬──────────────┘ │
+│  └──────┬──────┘                        │  直读           │
+│         │   Unix socket                 │                │
 │         │   ~/.local/share/gh6/gh6.sock │                │
-│  ┌──────┴──────┐         ┌──────────────┴──────────────┐ │
-│  │ gh6 status  │         │  gh6 analyze {sub}           │ │
-│  │ gh6 stop    │         │  gh6 export                  │ │
-│  └─────────────┘         └─────────────────────────────┘ │
+│  ┌──────┴──────────┐         ┌──────────┴──────────────┐ │
+│  │ gh6 run         │         │  gh6 analyze {sub}       │ │
+│  │ gh6 pause       │         │  gh6 export              │ │
+│  │ gh6 status      │         └─────────────────────────┘ │
+│  └─────────────────┘                                     │
 └──────────────────────────────────────────────────────────┘
 ```
+
+- **gh6d**：守护进程，由 launchd (macOS) 或 systemd (Linux) 管理，启动后处于 IDLE 状态
+- **gh6**：客户端 CLI，通过 Unix socket 向 gh6d 发送命令
 
 ## 命令体系
 
 ```
-gh6 crawl                    启动爬虫后台（配合 & 使用）
+gh6d                         启动守护进程（由 launchd / systemd 管理，无需手动调用）
+gh6 run                      开始 / 恢复爬取
+gh6 pause                    暂停爬取（守护进程保持运行）
 gh6 status [--watch]         查看进度 / 实时监控
-gh6 stop                     优雅停止
 
 gh6 analyze path <user>      查询从种子用户到目标用户的最短路径
 gh6 analyze neighbors <user> 查询某用户的直接连接
@@ -35,9 +41,21 @@ gh6 analyze degree-dist      各度数的人数分布
 gh6 export <file>            导出当前图谱（JSON 格式）
 ```
 
-- `status` / `stop` 通过 Unix socket 与爬虫进程通信
-- `analyze` / `export` 直接读取 SQLite，不依赖爬虫进程
+- `status` / `run` / `pause` 通过 Unix socket 与守护进程通信
+- `analyze` / `export` 直接读取 SQLite，不依赖守护进程
 - 所有子命令支持 `--json` 输出 JSON
+
+### 服务管理
+
+```bash
+# macOS (launchd)
+launchctl load ~/Library/LaunchAgents/com.gh6.daemon.plist    # 启动
+launchctl unload ~/Library/LaunchAgents/com.gh6.daemon.plist  # 停止
+
+# Linux (systemd)
+systemctl --user start gh6d    # 启动
+systemctl --user stop gh6d     # 停止
+```
 
 ## 通信协议
 
@@ -56,20 +74,30 @@ gh6 export <file>            导出当前图谱（JSON 格式）
 ### 命令流
 
 ```
-Client                            Server (crawl)
+Client                            Server (gh6d)
   │                                  │
   ├── {"cmd":"status"} ────────────→ │
   │←── {"type":"ok","data":{...}}    │  (立即返回，关闭连接)
   │                                  │
   ├── {"cmd":"status","watch":true}→ │
+  │←── {"type":"ok","data":{...}}    │  (先返回当前状态)
   │←── {"type":"event","data":{...}} │  (持续推送)
-  │←── {"type":"event","data":{...}} │
+  │←── {"type":"ok","data":{...}}    │  (定期快照)
   │       (客户端 Ctrl+C 断开)        │  (移除 subscriber)
   │                                  │
-  ├── {"cmd":"stop"} ──────────────→ │
-  │←── {"type":"ok"}                 │  (爬虫下个循环优雅退出)
-  │←── {"type":"bye"}                │  (广播退出消息)
+  ├── {"cmd":"start"} ─────────────→ │
+  │←── {"type":"ok","data":{"msg":"started"}} │
+  │                                  │
+  ├── {"cmd":"pause"} ─────────────→ │
+  │←── {"type":"ok","data":{"msg":"paused"}} │
+  │                                  │
+  │   (SIGTERM / SIGINT)             │
+  │←── {"type":"bye"}                │  (广播退出，守护关闭)
 ```
+
+- `start` 幂等：已运行时返回 `"already running"`
+- `pause` 幂等：已暂停时返回 `"already paused"`
+- 守护进程的终止由 launchd / systemd 管理（SIGTERM），不通过 socket 命令
 
 ### Status 响应
 
@@ -83,7 +111,8 @@ Client                            Server (crawl)
     "api_remaining": 4200,
     "api_reset_at": "2026-01-01T12:00:00Z",
     "uptime_secs": 18340,
-    "currently_crawling": "alice"
+    "currently_crawling": "alice",
+    "paused": false
   }
 }
 ```
@@ -101,18 +130,23 @@ Client                            Server (crawl)
 |------|------|
 | 多个客户端同时连接 | 每个连接 spawn 独立 tokio task |
 | `status`（一次性查询） | 读 `Arc<ServerState>`，返回后关闭 |
-| `status --watch` | 订阅 `tokio::sync::broadcast` channel |
-| `stop` | 设置 `AtomicBool`，爬虫主循环检查后退出 |
-| 多个 stop 请求 | 幂等，重复请求返回 `"already stopping"` |
+| `status --watch` | 订阅 `tokio::sync::broadcast` channel，定期推送快照 |
+| `start` / `pause` | 设置 `paused: AtomicBool`，爬虫主循环检查 |
+| 多次 start / pause | 幂等，重复请求返回 `"already running"` / `"already paused"` |
+| SIGTERM / SIGINT | 信号 handler 设 `shutdown: AtomicBool`，完成当前迭代后优雅退出 |
 
 ### 边界情况
 
 | 情况 | 处理 |
 |------|------|
-| 爬虫未运行，客户端连接失败 | 提示 `gh6 crawl 未在运行` |
-| 爬虫已在运行，重复 `gh6 crawl` | 连接已有 socket 检测存活，拒绝重复启动 |
-| 爬虫崩溃，socket 残留 | 启动时尝试连接，失败则 `unlink` 清理 |
-| `stop` 后爬虫仍在处理当前请求 | 完成当前 API 调用 + 落库后才退出，不丢数据 |
+| 守护未运行，客户端连接失败 | 提示 `gh6d daemon is not running` |
+| 守护已在运行，重复启动 | 连接已有 socket 检测存活，拒绝重复启动 |
+| 守护崩溃，socket 残留 | 启动时尝试连接，失败则 `unlink` 清理 |
+| 守护启动后默认 IDLE | `paused=true`，等待 `gh6 run` 才开始爬取 |
+| 队列空 | 自动设 `paused=true` 回到 IDLE 状态 |
+| `pause` 时正在处理 API 调用 | 完成当前迭代后暂停，不丢数据 |
+| rate-limit sleep 期间暂停 | sleep 可中断（每 1s 检查 paused/shutdown） |
+| SIGTERM 关闭 | 完成当前迭代 + 落库后退出，DB 数据一致 |
 
 ## 数据库
 
