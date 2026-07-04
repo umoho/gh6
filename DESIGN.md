@@ -49,8 +49,8 @@ gh6 export <file>            导出当前图谱（JSON 格式）
 
 ```bash
 # macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.gh6.daemon.plist    # 启动
-launchctl unload ~/Library/LaunchAgents/com.gh6.daemon.plist  # 停止
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gh6.daemon.plist    # 启动
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.gh6.daemon.plist    # 停止
 
 # Linux (systemd)
 systemctl --user start gh6d    # 启动

@@ -26,8 +26,9 @@ install() {
     mkdir -p "$(dirname "$PLIST_DST")"
     sed "s|/Users/umoho/.cargo/bin/gh6d|$GH6D_BIN|" "$PLIST_SRC" > "$PLIST_DST"
 
-    launchctl unload "$PLIST_DST" 2>/dev/null || true
-    launchctl load "$PLIST_DST"
+    local domain="gui/$UID"
+    launchctl bootout "$domain" "$PLIST_DST" 2>/dev/null || true
+    launchctl bootstrap "$domain" "$PLIST_DST"
 
     echo -e "${GREEN}✓${NC} Installed: ${GH6_BIN}"
     echo -e "${GREEN}✓${NC} Installed: ${GH6D_BIN}"
@@ -37,13 +38,13 @@ install() {
     echo "  gh6 run     — start crawling"
     echo "  gh6 pause   — pause crawling"
     echo "  gh6 status  — view progress"
-    echo "  launchctl unload $PLIST_DST  — stop daemon"
-    echo "  launchctl load $PLIST_DST    — start daemon"
+    echo "  launchctl bootout gui/\$UID $PLIST_DST  — stop daemon"
+    echo "  launchctl bootstrap gui/\$UID $PLIST_DST  — start daemon"
 }
 
 uninstall() {
     echo "=== Stopping daemon ==="
-    launchctl unload "$PLIST_DST" 2>/dev/null || echo "(not loaded)"
+    launchctl bootout "gui/$UID" "$PLIST_DST" 2>/dev/null || echo "(not loaded)"
 
     echo "=== Removing binaries ==="
     rm -f "$GH6_BIN" "$GH6D_BIN"
