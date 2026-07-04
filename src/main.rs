@@ -13,8 +13,8 @@ use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
 use gh6::analyze::{
-    self, AllPathsResult, BridgesResult, CommonResult, FuzzyPathResult, PathInfo, StatsResult,
-    SuggestResult, UserProfileResult,
+    self, AllPathsResult, BridgesResult, CommonResult, CommunitiesResult, FuzzyPathResult,
+    PathInfo, StatsResult, SuggestResult, UserProfileResult,
 };
 use gh6::db::Db;
 use gh6::types::*;
@@ -107,6 +107,18 @@ enum AnalyzeCommand {
         /// Max bridges to show (0 = all)
         #[arg(long, default_value = "20")]
         limit: usize,
+    },
+    /// Detect communities in the social graph
+    Communities {
+        /// Max communities to show (0 = all)
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Show which community a user belongs to
+        #[arg(long)]
+        user: Option<String>,
+        /// Community detection method
+        #[arg(long, default_value = "louvain")]
+        method: String,
     },
     /// Show offline database overview
     Stats,
@@ -1029,6 +1041,55 @@ fn print_all_paths(paths: &AllPathsResult, json: bool, with_profile: bool, with_
     }
 }
 
+fn print_communities(result: &CommunitiesResult, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
+    }
+
+    // --user mode: show single user's community.
+    if let Some(ref members) = result.user_members {
+        let cid = result.user_community.unwrap_or(0);
+        println!(
+            "🏘️ 所在社区: #{} ({} 人)",
+            cid,
+            fmt_thousands(members.len() as u64)
+        );
+        println!();
+        println!("  同社区成员:");
+        for m in members.iter().take(30) {
+            println!("    {m}");
+        }
+        if members.len() > 30 {
+            println!("    ... 还有 {} 人", members.len() - 30);
+        }
+        return;
+    }
+
+    if result.communities.is_empty() {
+        println!("图中没有检测到社区");
+        return;
+    }
+
+    println!(
+        "🏘️ 社区发现  ({} 算法, 模块度 Q={:.4})",
+        result.algorithm, result.modularity
+    );
+    println!("共 {} 个社区", result.num_communities);
+    println!();
+
+    for (i, c) in result.communities.iter().enumerate() {
+        let label = format!("#{}", i + 1);
+        let idx = label.dimmed();
+        let size = fmt_thousands(c.size as u64);
+        println!("  {idx:>3}  {size} 人");
+        if !c.representatives.is_empty() {
+            let reps = c.representatives.join(", ");
+            println!("       代表: {reps}");
+        }
+    }
+}
+
 fn print_export(users: usize, edges: usize, file: &str, json: bool) {
     if json {
         println!(
@@ -1204,6 +1265,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AnalyzeCommand::Bridges { limit } => {
                     let result = analyze::cmd_bridges(&db, limit)?;
                     print_bridges(&result, cli.json);
+                }
+                AnalyzeCommand::Communities {
+                    limit,
+                    user,
+                    method,
+                } => {
+                    if method != "louvain" {
+                        eprintln!("{} 不支持的方法: {method}（当前只支持 louvain）", "✗".red());
+                        std::process::exit(1);
+                    }
+                    let result = analyze::cmd_communities(&db, limit, user.as_deref())?;
+                    print_communities(&result, cli.json);
                 }
                 AnalyzeCommand::Stats => {
                     let stats = analyze::cmd_stats(&db)?;

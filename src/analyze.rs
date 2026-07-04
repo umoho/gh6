@@ -85,6 +85,27 @@ pub struct BridgesResult {
     pub bridges: Vec<Bridge>,
 }
 
+/// A single community.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommunityInfo {
+    pub id: usize,
+    pub size: usize,
+    pub representatives: Vec<String>,
+}
+
+/// Result for `analyze communities`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommunitiesResult {
+    pub algorithm: String,
+    pub modularity: f64,
+    pub num_communities: usize,
+    pub communities: Vec<CommunityInfo>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_community: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_members: Option<Vec<String>>,
+}
+
 /// A directed follows edge between two users.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DirectedEdge {
@@ -592,6 +613,272 @@ pub fn cmd_bridges(db: &Db, limit: usize) -> Result<BridgesResult, Box<dyn Error
     Ok(BridgesResult {
         baseline_components: baseline,
         bridges,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Louvain community detection (helpers)
+// ---------------------------------------------------------------------------
+
+/// Run a single pass of Louvain local optimisation and return
+/// `(node_id → community_id, modularity)`.
+fn louvain_pass(
+    adj: &std::collections::HashMap<i64, Vec<i64>>,
+    node_ids: &[i64],
+) -> (std::collections::HashMap<i64, usize>, f64) {
+    let n = node_ids.len();
+    if n == 0 {
+        return (std::collections::HashMap::new(), 0.0);
+    }
+
+    let id_to_idx: std::collections::HashMap<i64, usize> = node_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+
+    // Total edge count (undirected — each edge counted once).
+    let mut m: f64 = 0.0;
+    for neighbors in adj.values() {
+        m += neighbors.len() as f64;
+    }
+    m /= 2.0;
+
+    // Node degrees.
+    let degree: Vec<f64> = node_ids
+        .iter()
+        .map(|id| adj.get(id).map(|v| v.len()).unwrap_or(0) as f64)
+        .collect();
+
+    // Initialise: each node in its own community.
+    let mut community: Vec<usize> = (0..n).collect();
+    // Σ_tot_C — sum of degrees in each community.
+    let mut comm_degree: Vec<f64> = degree.clone();
+
+    let max_passes = 10;
+    for _pass in 0..max_passes {
+        let mut improved = false;
+
+        // Deterministic shuffle.
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = (i.wrapping_mul(2_654_435_761)) % (i + 1);
+            order.swap(i, j);
+        }
+
+        for &idx in &order {
+            let node = node_ids[idx];
+            let old_comm = community[idx];
+            let k_i = degree[idx];
+
+            // Count neighbours per community.
+            let mut nbr_comms: std::collections::HashMap<usize, f64> =
+                std::collections::HashMap::new();
+            if let Some(neighbors) = adj.get(&node) {
+                for &nbr in neighbors {
+                    if let Some(&nbr_idx) = id_to_idx.get(&nbr) {
+                        let c = community[nbr_idx];
+                        *nbr_comms.entry(c).or_insert(0.0) += 1.0;
+                    }
+                }
+            }
+
+            // Best move.
+            let k_i_in_old = nbr_comms.get(&old_comm).copied().unwrap_or(0.0);
+            let mut best_comm = old_comm;
+            let mut best_gain = 0.0;
+
+            for (&target, &k_i_in) in &nbr_comms {
+                if target == old_comm || m == 0.0 {
+                    continue;
+                }
+                // ΔQ = (k_i_in − k_i_in_old)/m
+                //    − k_i·(Σ_tot_target − (Σ_tot_old − k_i)) / (2m²)
+                let gain = (k_i_in - k_i_in_old) / m
+                    - k_i * (comm_degree[target] - (comm_degree[old_comm] - k_i)) / (2.0 * m * m);
+
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_comm = target;
+                }
+            }
+
+            if best_comm != old_comm {
+                community[idx] = best_comm;
+                comm_degree[old_comm] -= k_i;
+                comm_degree[best_comm] += k_i;
+                improved = true;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    // Remap community IDs to 0..k-1.
+    let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut next = 0usize;
+    let mut result = std::collections::HashMap::new();
+    for (i, &id) in node_ids.iter().enumerate() {
+        let c = community[i];
+        let mapped = *map.entry(c).or_insert_with(|| {
+            let v = next;
+            next += 1;
+            v
+        });
+        result.insert(id, mapped);
+    }
+
+    // Modularity.
+    let q = if m > 0.0 {
+        let mut qq = 0.0;
+        for (&a, neighbors) in adj {
+            let ca = result.get(&a).copied().unwrap_or(0);
+            let ka = degree[id_to_idx[&a]];
+            for &b in neighbors {
+                let cb = result.get(&b).copied().unwrap_or(0);
+                let kb = degree[id_to_idx[&b]];
+                if ca == cb {
+                    qq += 1.0 - ka * kb / (2.0 * m);
+                }
+            }
+        }
+        qq / (2.0 * m)
+    } else {
+        0.0
+    };
+
+    (result, q)
+}
+
+// ---------------------------------------------------------------------------
+// cmd_communities
+// ---------------------------------------------------------------------------
+
+/// Detect communities using Louvain on the follows graph.
+pub fn cmd_communities(
+    db: &Db,
+    limit: usize,
+    user: Option<&str>,
+) -> Result<CommunitiesResult, Box<dyn Error>> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::collections::HashMap;
+
+    // Build adjacency list.
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("🏘️ {msg} {spinner}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    pb.set_message("构建邻接表...".to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        for pair in rows {
+            let (a, b) = pair?;
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+    }
+
+    let all_users = db.get_all_users()?;
+    let node_ids: Vec<i64> = all_users.iter().map(|u| u.id).collect();
+    drop(pb);
+
+    // Run Louvain.
+    let pb2 = ProgressBar::new_spinner();
+    pb2.set_style(
+        ProgressStyle::with_template("🏘️ {msg} {spinner}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    pb2.set_message("Louvain 聚类中...".to_string());
+    pb2.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let (partition, modularity) = louvain_pass(&adj, &node_ids);
+    pb2.finish_and_clear();
+
+    // Group nodes by community.
+    let mut communities: HashMap<usize, Vec<i64>> = HashMap::new();
+    for (&uid, &cid) in &partition {
+        communities.entry(cid).or_default().push(uid);
+    }
+
+    // Build result.
+    let num_communities = communities.len();
+    let login_map: HashMap<i64, &str> =
+        all_users.iter().map(|u| (u.id, u.login.as_str())).collect();
+
+    let mut comm_list: Vec<CommunityInfo> = communities
+        .iter()
+        .map(|(&cid, members)| {
+            // Representatives: top 3 by degree.
+            let mut reps: Vec<(i64, usize)> = members
+                .iter()
+                .map(|&uid| (uid, adj.get(&uid).map(|v| v.len()).unwrap_or(0)))
+                .collect();
+            reps.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+            let rep_logins: Vec<String> = reps
+                .iter()
+                .take(3)
+                .filter_map(|(uid, _)| login_map.get(uid).map(|s| s.to_string()))
+                .collect();
+
+            CommunityInfo {
+                id: cid,
+                size: members.len(),
+                representatives: rep_logins,
+            }
+        })
+        .collect();
+
+    // Sort by size descending.
+    comm_list.sort_by_key(|c| std::cmp::Reverse(c.size));
+    if limit > 0 && comm_list.len() > limit {
+        comm_list.truncate(limit);
+    }
+
+    // User lookup.
+    let user_community;
+    let user_members;
+    if let Some(login) = user {
+        let u = db
+            .get_user_by_login(login)?
+            .ok_or_else(|| format!("user not found: {login}"))?;
+        if let Some(&cid) = partition.get(&u.id) {
+            user_community = Some(cid);
+            let members: Vec<String> = communities
+                .get(&cid)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| login_map.get(id).map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            user_members = Some(members);
+        } else {
+            user_community = None;
+            user_members = None;
+        }
+    } else {
+        user_community = None;
+        user_members = None;
+    }
+
+    Ok(CommunitiesResult {
+        algorithm: "louvain".to_string(),
+        modularity,
+        num_communities,
+        communities: comm_list,
+        user_community,
+        user_members,
     })
 }
 
