@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
-use gh6::analyze::{self, AllPathsResult, FuzzyPathResult, NeighborsResult};
+use gh6::analyze::{self, AllPathsResult, CommonResult, FuzzyPathResult, UserProfileResult};
 use gh6::db::Db;
 use gh6::types::*;
 
@@ -67,8 +67,22 @@ enum AnalyzeCommand {
         #[arg(long, default_value = "200")]
         limit: usize,
     },
-    /// Show a user's direct connections
-    Neighbors { user: String },
+    /// Show common connections between two users
+    Common {
+        user1: String,
+        user2: String,
+        /// Only show common following
+        #[arg(long)]
+        following: bool,
+        /// Only show common followers
+        #[arg(long)]
+        followers: bool,
+        /// Max results (0 = all)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show a user's profile and social graph
+    User { login: String },
     /// Show distribution of users by BFS degree
     DegreeDist,
     /// Show offline database overview
@@ -456,52 +470,162 @@ fn print_path(path: &[User], json: bool) {
     println!("({steps} 步)");
 }
 
-fn print_neighbors(result: &NeighborsResult, json: bool) {
+fn print_common(result: &CommonResult, json: bool, show_following: bool, show_followers: bool) {
     if json {
         println!("{}", serde_json::to_string(result).unwrap());
         return;
     }
 
-    // Compute mutual follows
-    let f_set: std::collections::HashSet<&str> =
-        result.following.iter().map(|s| s.as_str()).collect();
-    let mut following_only: Vec<&str> = Vec::new();
-    let mut mutual: Vec<&str> = Vec::new();
-    let mut followers_only: Vec<&str> = Vec::new();
+    // If neither flag is set, show both sections.
+    let show_both = !show_following && !show_followers;
 
-    for f in &result.following {
-        if result.followers.contains(f) {
-            mutual.push(f.as_str());
+    let u1 = result.user1.blue();
+    let u2 = result.user2.blue();
+    println!("{u1} 和 {u2}");
+    println!();
+
+    if show_following || show_both {
+        let label = format!("({})", result.common_following.len());
+        let count = label.dimmed();
+        println!("  共同关注 {count}:");
+        if result.common_following.is_empty() {
+            println!("    （无）");
         } else {
-            following_only.push(f.as_str());
+            for login in &result.common_following {
+                println!("    {login}");
+            }
         }
-    }
-    for f in &result.followers {
-        if !f_set.contains(f.as_str()) {
-            followers_only.push(f.as_str());
+        if show_both && (!result.common_following.is_empty() || !result.common_followers.is_empty())
+        {
+            println!();
         }
     }
 
-    let user = result.login.blue().to_string();
-    println!("👤 {user}");
+    if show_followers || show_both {
+        let label = format!("({})", result.common_followers.len());
+        let count = label.dimmed();
+        println!("  共同粉丝 {count}:");
+        if result.common_followers.is_empty() {
+            println!("    （无）");
+        } else {
+            for login in &result.common_followers {
+                println!("    {login}");
+            }
+        }
+    }
+}
 
-    if !following_only.is_empty() {
-        let arrow = "→".green();
-        let s = format!("({})", following_only.len());
-        let count = s.dimmed();
-        println!("  {arrow} following {count}  {}", following_only.join(", "));
+fn print_user(result: &UserProfileResult, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
     }
-    if !mutual.is_empty() {
-        let arrow = "⇄".yellow();
-        let s = format!("({})", mutual.len());
-        let count = s.dimmed();
-        println!("  {arrow} mutual {count}     {}", mutual.join(", "));
+
+    const NA: &str = "（未爬取）";
+
+    println!("👤 {}", result.login.blue());
+    println!();
+
+    // Determine whether the user's full profile has been fetched.
+    let profile_crawled = result.name.is_some()
+        || result.company.is_some()
+        || result.location.is_some()
+        || result.created_at.is_some();
+
+    // ── Profile ──
+    println!("  基本信息");
+    if profile_crawled {
+        let date = result
+            .created_at
+            .as_ref()
+            .map(|s| &s[..s.len().min(10)])
+            .unwrap_or(NA);
+        let items: Vec<(&str, &str)> = vec![
+            ("name:       ", result.name.as_deref().unwrap_or(NA)),
+            ("company:    ", result.company.as_deref().unwrap_or(NA)),
+            ("location:   ", result.location.as_deref().unwrap_or(NA)),
+            ("账号创建:   ", date),
+        ];
+        let last = items.len() - 1;
+        for (i, (label, value)) in items.iter().enumerate() {
+            let c = if i == last { "└" } else { "├" };
+            println!("  {c} {label}{value}");
+        }
+    } else {
+        println!("  └ {NA}");
     }
-    if !followers_only.is_empty() {
-        let arrow = "←".cyan();
-        let s = format!("({})", followers_only.len());
-        let count = s.dimmed();
-        println!("  {arrow} followers {count}  {}", followers_only.join(", "));
+    println!();
+
+    // ── GitHub stats ──
+    println!("  GitHub 统计");
+    if profile_crawled {
+        let f = |n: i64| {
+            if n == 0 {
+                "0".to_string()
+            } else {
+                fmt_thousands(n as u64)
+            }
+        };
+        let items: Vec<(&str, String)> = vec![
+            ("followers:   ", format!("{} 人", f(result.followers_count))),
+            ("following:   ", format!("{} 人", f(result.following_count))),
+            ("公开仓库:    ", format!("{} 个", f(result.public_repos))),
+        ];
+        let last = items.len() - 1;
+        for (i, (label, value)) in items.iter().enumerate() {
+            let c = if i == last { "└" } else { "├" };
+            println!("  {c} {label}{value}");
+        }
+    } else {
+        println!("  └ {NA}");
+    }
+    println!();
+
+    // ── Social relationships ──
+    let mutual_set: std::collections::HashSet<&str> =
+        result.mutual.iter().map(|s| s.as_str()).collect();
+    let following_only: Vec<&str> = result
+        .following
+        .iter()
+        .filter(|s| !mutual_set.contains(s.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    let following_set: std::collections::HashSet<&str> =
+        result.following.iter().map(|s| s.as_str()).collect();
+    let followers_only: Vec<&str> = result
+        .followers
+        .iter()
+        .filter(|s| !following_set.contains(s.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    let has_any =
+        !following_only.is_empty() || !result.mutual.is_empty() || !followers_only.is_empty();
+
+    if !has_any {
+        println!("  社交关系");
+        println!("  └ （无）");
+    } else {
+        if !following_only.is_empty() {
+            let arrow = "→".green();
+            let s = format!("({})", following_only.len());
+            let count = s.dimmed();
+            println!("  {arrow} following {count}  {}", following_only.join(", "));
+        }
+        if !result.mutual.is_empty() {
+            let arrow = "⇄".yellow();
+            let s = format!("({})", result.mutual.len());
+            let count = s.dimmed();
+            let names: Vec<&str> = result.mutual.iter().map(|s| s.as_str()).collect();
+            println!("  {arrow} mutual {count}     {}", names.join(", "));
+        }
+        if !followers_only.is_empty() {
+            let arrow = "←".cyan();
+            let s = format!("({})", followers_only.len());
+            let count = s.dimmed();
+            println!("  {arrow} followers {count}  {}", followers_only.join(", "));
+        }
     }
 }
 
@@ -786,9 +910,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                AnalyzeCommand::Neighbors { user } => {
-                    let result = analyze::cmd_neighbors(&db, &user)?;
-                    print_neighbors(&result, cli.json);
+                AnalyzeCommand::Common {
+                    user1,
+                    user2,
+                    following,
+                    followers,
+                    limit,
+                } => {
+                    let result = analyze::cmd_common(&db, &user1, &user2, limit)?;
+                    print_common(&result, cli.json, following, followers);
+                }
+                AnalyzeCommand::User { login } => {
+                    let result = analyze::cmd_user(&db, &login)?;
+                    print_user(&result, cli.json);
                 }
                 AnalyzeCommand::DegreeDist => {
                     let dist = analyze::cmd_degree_dist(&db)?;

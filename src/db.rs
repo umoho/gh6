@@ -576,6 +576,72 @@ impl Db {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // -----------------------------------------------------------------------
+    // Common connections
+    // -----------------------------------------------------------------------
+
+    /// Find logins of users that both `user1_id` and `user2_id` follow.
+    ///
+    /// When `limit` is 0, no LIMIT clause is applied (returns all results).
+    pub fn get_common_following(
+        &self,
+        user1_id: i64,
+        user2_id: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, DbError> {
+        let limit_clause = if limit == 0 {
+            String::new()
+        } else {
+            format!("LIMIT {limit}")
+        };
+        let sql = format!(
+            "SELECT DISTINCT u.login \
+             FROM edges e1 \
+             JOIN users u ON e1.to_user_id = u.id \
+             JOIN edges e2 ON e1.to_user_id = e2.to_user_id \
+             WHERE e1.from_user_id = ?1 \
+               AND e2.from_user_id = ?2 \
+               AND e1.edge_type = 'follows' \
+               AND e2.edge_type = 'follows' \
+             ORDER BY u.login \
+             {limit_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![user1_id, user2_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Find logins of users that follow both `user1_id` and `user2_id`.
+    ///
+    /// When `limit` is 0, no LIMIT clause is applied (returns all results).
+    pub fn get_common_followers(
+        &self,
+        user1_id: i64,
+        user2_id: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, DbError> {
+        let limit_clause = if limit == 0 {
+            String::new()
+        } else {
+            format!("LIMIT {limit}")
+        };
+        let sql = format!(
+            "SELECT DISTINCT u.login \
+             FROM edges e1 \
+             JOIN users u ON e1.from_user_id = u.id \
+             JOIN edges e2 ON e1.from_user_id = e2.from_user_id \
+             WHERE e1.to_user_id = ?1 \
+               AND e2.to_user_id = ?2 \
+               AND e1.edge_type = 'follows' \
+               AND e2.edge_type = 'follows' \
+             ORDER BY u.login \
+             {limit_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![user1_id, user2_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 // ---------------------------------------------------------------------------

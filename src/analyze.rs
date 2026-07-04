@@ -25,12 +25,29 @@ use crate::types::{DegreeDist, User};
 // Public result types
 // ---------------------------------------------------------------------------
 
-/// Neighbours of a user, split into *following* (outgoing follows edges) and
-/// *followers* (incoming follows edges).
+/// Result for `analyze common` — shared followings and followers between two
+/// users.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct NeighborsResult {
+pub struct CommonResult {
+    pub user1: String,
+    pub user2: String,
+    pub common_following: Vec<String>,
+    pub common_followers: Vec<String>,
+}
+
+/// Profile and social-graph information for a single user.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserProfileResult {
     pub login: String,
+    pub name: Option<String>,
+    pub company: Option<String>,
+    pub location: Option<String>,
+    pub created_at: Option<String>,
+    pub followers_count: i64,
+    pub following_count: i64,
+    pub public_repos: i64,
     pub following: Vec<String>,
+    pub mutual: Vec<String>,
     pub followers: Vec<String>,
 }
 
@@ -79,14 +96,84 @@ pub fn cmd_fuzzy_path(db: &Db, from: &str, q: &str) -> Result<FuzzyPathResult, B
 }
 
 // ---------------------------------------------------------------------------
-// cmd_neighbors
+// cmd_common
 // ---------------------------------------------------------------------------
 
-/// List the direct connections of a user, grouped by direction.
+/// Find users that both `user1` and `user2` follow, and users that follow
+/// both of them.
 ///
-/// Only considers `edge_type = "follows"` edges (the FollowCrawler output).
-/// Returns `Err` if the user is not found in the database.
-pub fn cmd_neighbors(db: &Db, login: &str) -> Result<NeighborsResult, Box<dyn Error>> {
+/// When `user1 == user2`, `common_following` returns all of that user's
+/// followings and `common_followers` returns all of their followers.
+///
+/// # Errors
+///
+/// Returns an error if either user is not found in the database.
+pub fn cmd_common(
+    db: &Db,
+    user1: &str,
+    user2: &str,
+    limit: usize,
+) -> Result<CommonResult, Box<dyn Error>> {
+    let u1 = db
+        .get_user_by_login(user1)?
+        .ok_or_else(|| format!("user not found: {user1}"))?;
+    let u2 = db
+        .get_user_by_login(user2)?
+        .ok_or_else(|| format!("user not found: {user2}"))?;
+
+    let (common_following, common_followers) = if u1.id == u2.id {
+        // Same user: return all followings / all followers.
+        let edges = db.get_edges_by_user(u1.id)?;
+        let mut following = Vec::new();
+        let mut followers = Vec::new();
+        for edge in &edges {
+            if edge.edge_type != "follows" {
+                continue;
+            }
+            if edge.from_user_id == u1.id {
+                if let Some(u) = db.get_user_by_id(edge.to_user_id)? {
+                    following.push(u.login);
+                }
+            } else if edge.to_user_id == u1.id
+                && let Some(u) = db.get_user_by_id(edge.from_user_id)?
+            {
+                followers.push(u.login);
+            }
+        }
+        following.sort();
+        followers.sort();
+        let following = apply_limit(following, limit);
+        let followers = apply_limit(followers, limit);
+        (following, followers)
+    } else {
+        (
+            db.get_common_following(u1.id, u2.id, limit)?,
+            db.get_common_followers(u1.id, u2.id, limit)?,
+        )
+    };
+
+    Ok(CommonResult {
+        user1: user1.to_string(),
+        user2: user2.to_string(),
+        common_following,
+        common_followers,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// cmd_user
+// ---------------------------------------------------------------------------
+
+/// Return the profile information and social-graph neighbours for a single
+/// user.
+///
+/// Profile fields (`name`, `company`, etc.) come from the `users` table and
+/// may be empty for users whose profiles haven't been fetched yet.
+///
+/// # Errors
+///
+/// Returns an error if the user is not found in the database.
+pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error>> {
     let user = db
         .get_user_by_login(login)?
         .ok_or_else(|| format!("user not found: {login}"))?;
@@ -102,25 +189,39 @@ pub fn cmd_neighbors(db: &Db, login: &str) -> Result<NeighborsResult, Box<dyn Er
         }
 
         if edge.from_user_id == user.id {
-            // I follow them → outgoing
             if let Some(other) = db.get_user_by_id(edge.to_user_id)? {
                 following.push(other.login);
             }
-        } else if edge.to_user_id == user.id {
-            // They follow me → incoming
-            if let Some(other) = db.get_user_by_id(edge.from_user_id)? {
-                followers.push(other.login);
-            }
+        } else if edge.to_user_id == user.id
+            && let Some(other) = db.get_user_by_id(edge.from_user_id)?
+        {
+            followers.push(other.login);
         }
     }
 
-    // Stable sort for deterministic output
     following.sort();
     followers.sort();
 
-    Ok(NeighborsResult {
+    // Compute mutual: users that appear in both lists.
+    let f_set: std::collections::HashSet<&str> = following.iter().map(|s| s.as_str()).collect();
+    let mut mutual: Vec<String> = followers
+        .iter()
+        .filter(|s| f_set.contains(s.as_str()))
+        .cloned()
+        .collect();
+    mutual.sort();
+
+    Ok(UserProfileResult {
         login: user.login,
+        name: user.name,
+        company: user.company,
+        location: user.location,
+        created_at: user.created_at,
+        followers_count: user.followers,
+        following_count: user.following,
+        public_repos: user.public_repos,
         following,
+        mutual,
         followers,
     })
 }
@@ -220,6 +321,20 @@ pub fn cmd_export(db: &Db, file: &str) -> Result<(usize, usize), Box<dyn Error>>
     let edge_count = graph.edges.len();
 
     Ok((user_count, edge_count))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Truncate a sorted `Vec` to at most `limit` elements.
+/// A `limit` of 0 means "no limit" — the original vector is returned
+/// unchanged.
+fn apply_limit(mut v: Vec<String>, limit: usize) -> Vec<String> {
+    if limit > 0 && v.len() > limit {
+        v.truncate(limit);
+    }
+    v
 }
 
 // ===========================================================================
