@@ -148,7 +148,7 @@ fn bar(width: u64, max: u64, bar_width: usize) -> String {
 
 // ── Socket Client ────────────────────────────────────────────────────────────
 
-const NOT_RUNNING_MSG: &str = "gh6d 守护进程未运行。启动：systemctl --user start gh6d";
+const NOT_RUNNING_MSG: &str = "gh6d 守护进程未运行。";
 
 async fn send_socket_command(
     cmd: &serde_json::Value,
