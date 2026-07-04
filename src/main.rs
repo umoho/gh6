@@ -13,7 +13,8 @@ use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
 use gh6::analyze::{
-    self, AllPathsResult, CommonResult, FuzzyPathResult, PathInfo, StatsResult, UserProfileResult,
+    self, AllPathsResult, BridgesResult, CommonResult, FuzzyPathResult, PathInfo, StatsResult,
+    SuggestResult, UserProfileResult,
 };
 use gh6::db::Db;
 use gh6::types::*;
@@ -68,6 +69,12 @@ enum AnalyzeCommand {
         /// Max paths for --all (default: 200)
         #[arg(long, default_value = "200")]
         limit: usize,
+        /// Show profile info along the path
+        #[arg(long)]
+        with_profile: bool,
+        /// Show path statistics
+        #[arg(long)]
+        with_stats: bool,
     },
     /// Show common connections between two users
     Common {
@@ -85,6 +92,22 @@ enum AnalyzeCommand {
     },
     /// Show a user's profile and social graph
     User { login: String },
+    /// Recommend users based on common follows
+    Suggest {
+        user: String,
+        /// Max suggestions (0 = all)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Show who contributed to each recommendation
+        #[arg(long)]
+        reason: bool,
+    },
+    /// Find bridge nodes that connect different communities
+    Bridges {
+        /// Max bridges to show (0 = all)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
     /// Show offline database overview
     Stats,
     /// Export the graph to a JSON file
@@ -445,7 +468,7 @@ fn print_event(resp: &ServerResponse, _has_progress: bool) {
     }
 }
 
-fn print_path(info: &PathInfo, json: bool) {
+fn print_path(info: &PathInfo, json: bool, with_profile: bool, with_stats: bool) {
     if json {
         let logins: Vec<&str> = info.path.iter().map(|u| u.login.as_str()).collect();
         let edges: Vec<serde_json::Value> = info
@@ -464,23 +487,42 @@ fn print_path(info: &PathInfo, json: bool) {
         return;
     }
 
-    let route: Vec<String> = info
-        .path
-        .iter()
-        .enumerate()
-        .map(|(i, u)| {
-            if i == 0 {
+    let sep = "·".dimmed();
+    let steps = info.path.len() - 1;
+
+    if with_profile {
+        for (i, u) in info.path.iter().enumerate() {
+            let label = if i == 0 {
                 u.login.bold().to_string()
             } else if i == info.path.len() - 1 {
                 u.login.green().bold().to_string()
             } else {
                 u.login.to_string()
+            };
+            let detail = user_detail_line(u);
+            if detail.is_empty() {
+                println!("  {label}");
+            } else {
+                println!("  {label}  ({detail})");
             }
-        })
-        .collect();
-    let sep = "·".dimmed();
-    let steps = info.path.len() - 1;
-    println!("路径: {}  ({steps} 步)", route.join(&format!(" {sep} ")));
+        }
+    } else {
+        let route: Vec<String> = info
+            .path
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                if i == 0 {
+                    u.login.bold().to_string()
+                } else if i == info.path.len() - 1 {
+                    u.login.green().bold().to_string()
+                } else {
+                    u.login.to_string()
+                }
+            })
+            .collect();
+        println!("路径: {}  ({steps} 步)", route.join(&format!(" {sep} ")));
+    }
 
     if !info.directed_edges.is_empty() {
         println!();
@@ -492,6 +534,19 @@ fn print_path(info: &PathInfo, json: bool) {
     } else if steps > 0 {
         println!();
         println!("  （无已知方向）");
+    }
+
+    if with_stats && steps > 0 {
+        let middle = steps.saturating_sub(1);
+        let avg_followers: f64 = if info.path.is_empty() {
+            0.0
+        } else {
+            info.path.iter().map(|u| u.followers as f64).sum::<f64>() / info.path.len() as f64
+        };
+        println!();
+        println!("  ──");
+        println!("  中间节点: {middle} 个");
+        println!("  平均粉丝: {:.0}", avg_followers);
     }
 }
 
@@ -719,7 +774,86 @@ fn print_stats(s: &StatsResult, json: bool) {
     );
 }
 
-fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
+fn print_suggest(result: &SuggestResult, json: bool, reason: bool) {
+    if json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
+    }
+
+    if result.based_on == 0 {
+        println!("无法推荐：{} 没有关注任何人", result.user.dimmed());
+        return;
+    }
+
+    if result.suggestions.is_empty() {
+        println!("暂无推荐，试试先多爬些数据");
+        return;
+    }
+
+    println!(
+        "基于 {} 的社交圈推荐  top {}",
+        result.user.blue(),
+        result.suggestions.len()
+    );
+    println!();
+
+    let max_weight = result.suggestions.first().map(|s| s.weight).unwrap_or(1.0);
+
+    for (i, s) in result.suggestions.iter().enumerate() {
+        let label = format!("#{}", i + 1);
+        let idx = label.dimmed();
+        let bar_len = if max_weight > 0.0 {
+            (s.weight / max_weight * 20.0) as usize
+        } else {
+            0
+        };
+        let bar = "█".repeat(bar_len);
+        let bar_str = bar.dimmed();
+        println!("  {idx:>4}  {}  {bar_str} 权重 {:.2}", s.login, s.weight);
+
+        if reason && !s.mutual_friends.is_empty() {
+            let friends = s.mutual_friends.join(", ");
+            println!("        └─ {} 都关注了 ta", friends.dimmed());
+        }
+    }
+    println!();
+    println!(
+        "（基于 {} 个关注者，覆盖 {} 个候选）",
+        result.based_on.to_string().dimmed(),
+        result.candidates.to_string().dimmed()
+    );
+}
+
+fn print_bridges(result: &BridgesResult, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
+    }
+
+    if result.bridges.is_empty() {
+        println!("图中没有足够数据计算桥梁节点");
+        return;
+    }
+
+    println!("🌉 桥梁节点  top {}", result.bridges.len());
+    println!("（隐藏后连通分量从 {} 增加）", result.baseline_components);
+    println!();
+
+    for (i, b) in result.bridges.iter().enumerate() {
+        let label = format!("#{}", i + 1);
+        let idx = label.dimmed();
+        let f = |n: i64| fmt_thousands(n as u64);
+        println!(
+            "  {idx:>3}  {}           关注 {}  粉丝 {}  关键性 +{}",
+            b.login,
+            f(b.following),
+            f(b.followers),
+            b.impact
+        );
+    }
+}
+
+fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool, with_profile: bool, with_stats: bool) {
     if json {
         let out: Vec<serde_json::Value> = results
             .iter()
@@ -743,19 +877,30 @@ fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
     }
 
     let sep = "·".dimmed();
+    let mut total_steps = 0usize;
+    let mut total_followers: f64 = 0.0;
+    let mut total_users = 0usize;
+
     for (i, (_user, info)) in results.iter().enumerate() {
         let route: Vec<String> = info
             .path
             .iter()
             .enumerate()
             .map(|(j, u)| {
-                if j == 0 {
+                let mut s = if j == 0 {
                     u.login.bold().to_string()
                 } else if j == info.path.len() - 1 {
                     u.login.green().bold().to_string()
                 } else {
                     u.login.to_string()
+                };
+                if with_profile {
+                    let detail = user_detail_line(u);
+                    if !detail.is_empty() {
+                        s.push_str(&format!(" ({detail})"));
+                    }
                 }
+                s
             })
             .collect();
         let steps = info.path.len() - 1;
@@ -768,10 +913,44 @@ fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
                 println!("       {} {arrow} {}", e.from, e.to);
             }
         }
+        total_steps += steps;
+        for u in &info.path {
+            total_followers += u.followers as f64;
+            total_users += 1;
+        }
+    }
+
+    if with_stats && total_steps > 0 {
+        let avg_followers = if total_users > 0 {
+            total_followers / total_users as f64
+        } else {
+            0.0
+        };
+        println!();
+        println!("  ──");
+        println!("  路径数: {}", results.len());
+        println!("  总步数: {total_steps}");
+        println!("  平均粉丝: {:.0}", avg_followers);
     }
 }
 
-fn print_all_paths(paths: &AllPathsResult, json: bool) {
+/// Build a short detail string from a user's profile (name + company).
+fn user_detail_line(u: &User) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(ref name) = u.name
+        && !name.is_empty()
+    {
+        parts.push(name);
+    }
+    if let Some(ref company) = u.company
+        && !company.is_empty()
+    {
+        parts.push(company);
+    }
+    parts.join(" · ")
+}
+
+fn print_all_paths(paths: &AllPathsResult, json: bool, with_profile: bool, with_stats: bool) {
     if json {
         let out: Vec<serde_json::Value> = paths
             .iter()
@@ -793,19 +972,30 @@ fn print_all_paths(paths: &AllPathsResult, json: bool) {
         return;
     }
     let sep = "·".dimmed();
+    let mut total_steps = 0usize;
+    let mut total_followers: f64 = 0.0;
+    let mut total_users = 0usize;
+
     for (i, info) in paths.iter().enumerate() {
         let route: Vec<String> = info
             .path
             .iter()
             .enumerate()
             .map(|(j, u)| {
-                if j == 0 {
+                let mut s = if j == 0 {
                     u.login.bold().to_string()
                 } else if j == info.path.len() - 1 {
                     u.login.green().bold().to_string()
                 } else {
                     u.login.to_string()
+                };
+                if with_profile {
+                    let detail = user_detail_line(u);
+                    if !detail.is_empty() {
+                        s.push_str(&format!(" ({detail})"));
+                    }
                 }
+                s
             })
             .collect();
         let steps = info.path.len() - 1;
@@ -818,6 +1008,24 @@ fn print_all_paths(paths: &AllPathsResult, json: bool) {
                 println!("       {} {arrow} {}", e.from, e.to);
             }
         }
+        total_steps += steps;
+        for u in &info.path {
+            total_followers += u.followers as f64;
+            total_users += 1;
+        }
+    }
+
+    if with_stats && total_steps > 0 {
+        let avg_followers = if total_users > 0 {
+            total_followers / total_users as f64
+        } else {
+            0.0
+        };
+        println!();
+        println!("  ──");
+        println!("  路径数: {}", paths.len());
+        println!("  总步数: {total_steps}");
+        println!("  平均粉丝: {:.0}", avg_followers);
     }
 }
 
@@ -933,6 +1141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     from,
                     all,
                     limit,
+                    with_profile,
+                    with_stats,
                 } => {
                     let found = analyze::cmd_path(&db, &from, &user)?;
                     if all {
@@ -946,14 +1156,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("未找到匹配");
                                 }
                             } else {
-                                print_fuzzy_paths(&matches, cli.json);
+                                print_fuzzy_paths(&matches, cli.json, with_profile, with_stats);
                             }
                         } else {
-                            print_all_paths(&paths, cli.json);
+                            print_all_paths(&paths, cli.json, with_profile, with_stats);
                         }
                     } else {
                         match found {
-                            Some(path) => print_path(&path, cli.json),
+                            Some(info) => print_path(&info, cli.json, with_profile, with_stats),
                             None => {
                                 let matches = analyze::cmd_fuzzy_path(&db, &from, &user)?;
                                 if matches.is_empty() {
@@ -963,7 +1173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         println!("未找到匹配 {} 的用户", user.dimmed());
                                     }
                                 } else {
-                                    print_fuzzy_paths(&matches, cli.json);
+                                    print_fuzzy_paths(&matches, cli.json, with_profile, with_stats);
                                 }
                             }
                         }
@@ -982,6 +1192,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AnalyzeCommand::User { login } => {
                     let result = analyze::cmd_user(&db, &login)?;
                     print_user(&result, cli.json);
+                }
+                AnalyzeCommand::Suggest {
+                    user,
+                    limit,
+                    reason,
+                } => {
+                    let result = analyze::cmd_suggest(&db, &user, limit)?;
+                    print_suggest(&result, cli.json, reason);
+                }
+                AnalyzeCommand::Bridges { limit } => {
+                    let result = analyze::cmd_bridges(&db, limit)?;
+                    print_bridges(&result, cli.json);
                 }
                 AnalyzeCommand::Stats => {
                     let stats = analyze::cmd_stats(&db)?;

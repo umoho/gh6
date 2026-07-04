@@ -51,6 +51,40 @@ pub struct UserProfileResult {
     pub followers: Vec<String>,
 }
 
+/// A suggestion for `analyze suggest`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Suggestion {
+    pub login: String,
+    pub weight: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub mutual_friends: Vec<String>,
+}
+
+/// Result for `analyze suggest`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SuggestResult {
+    pub user: String,
+    pub based_on: usize,
+    pub candidates: usize,
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// A bridge node with its impact score.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Bridge {
+    pub login: String,
+    pub following: i64,
+    pub followers: i64,
+    pub impact: usize,
+}
+
+/// Result for `analyze bridges`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BridgesResult {
+    pub baseline_components: usize,
+    pub bridges: Vec<Bridge>,
+}
+
 /// A directed follows edge between two users.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DirectedEdge {
@@ -359,6 +393,205 @@ pub fn cmd_stats(db: &Db) -> Result<StatsResult, Box<dyn Error>> {
         avg_in_degree,
         users_with_outgoing,
         users_with_incoming,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// cmd_suggest
+// ---------------------------------------------------------------------------
+
+/// Recommend users via Adamic-Adar on the follows graph.
+pub fn cmd_suggest(db: &Db, login: &str, limit: usize) -> Result<SuggestResult, Box<dyn Error>> {
+    let user = db
+        .get_user_by_login(login)?
+        .ok_or_else(|| format!("user not found: {login}"))?;
+
+    // Get the users I follow.
+    let edges = db.get_edges_by_user(user.id)?;
+    let my_following_ids: std::collections::HashSet<i64> = edges
+        .iter()
+        .filter(|e| e.edge_type == "follows" && e.from_user_id == user.id)
+        .map(|e| e.to_user_id)
+        .collect();
+
+    let following: Vec<(i64, String)> = edges
+        .iter()
+        .filter(|e| e.edge_type == "follows" && e.from_user_id == user.id)
+        .filter_map(|e| {
+            db.get_user_by_id(e.to_user_id)
+                .ok()
+                .flatten()
+                .map(|u| (u.id, u.login))
+        })
+        .collect();
+
+    if following.is_empty() {
+        return Ok(SuggestResult {
+            user: login.to_string(),
+            based_on: 0,
+            candidates: 0,
+            suggestions: Vec::new(),
+        });
+    }
+
+    // Accumulate scores: candidate_id → (weight, Vec<mutual_friend_login>)
+    let mut scores: std::collections::HashMap<i64, (f64, Vec<String>)> =
+        std::collections::HashMap::new();
+
+    for (y_id, y_login) in &following {
+        let y_count = db.get_following_count(*y_id)?;
+        if y_count == 0 {
+            continue; // skip users whose following list hasn't been crawled
+        }
+        let weight_contrib = 1.0 / (y_count as f64).ln();
+
+        let y_edges = db.get_edges_by_user(*y_id)?;
+        for edge in &y_edges {
+            if edge.edge_type != "follows" || edge.from_user_id != *y_id {
+                continue;
+            }
+            let x_id = edge.to_user_id;
+            // Skip myself and people I already follow.
+            if x_id == user.id || my_following_ids.contains(&x_id) {
+                continue;
+            }
+            let entry = scores.entry(x_id).or_insert((0.0, Vec::new()));
+            entry.0 += weight_contrib;
+            entry.1.push(y_login.clone());
+        }
+    }
+
+    let candidates = scores.len();
+
+    // Fetch logins for candidates.
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+    for (x_id, (weight, friends)) in scores {
+        if let Some(u) = db.get_user_by_id(x_id)? {
+            suggestions.push(Suggestion {
+                login: u.login,
+                weight,
+                mutual_friends: friends,
+            });
+        }
+    }
+
+    // Sort descending by weight.
+    suggestions.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if limit > 0 && suggestions.len() > limit {
+        suggestions.truncate(limit);
+    }
+
+    Ok(SuggestResult {
+        user: login.to_string(),
+        based_on: following.len(),
+        candidates,
+        suggestions,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// cmd_bridges
+// ---------------------------------------------------------------------------
+
+/// Find bridge nodes by simulating the removal of each user with outgoing
+/// edges and measuring the change in connected-component count.
+pub fn cmd_bridges(db: &Db, limit: usize) -> Result<BridgesResult, Box<dyn Error>> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Build adjacency list (undirected, follows only).
+    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        for pair in rows {
+            let (a, b) = pair?;
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+    }
+
+    let all_users = db.get_all_users()?;
+
+    // Count connected components (baseline).
+    let count_components = |exclude: Option<i64>| -> usize {
+        let mut visited = HashSet::new();
+        if let Some(eid) = exclude {
+            visited.insert(eid);
+        }
+        let mut num = 0usize;
+        for u in &all_users {
+            if visited.contains(&u.id) {
+                continue;
+            }
+            num += 1;
+            let mut queue = VecDeque::new();
+            queue.push_back(u.id);
+            visited.insert(u.id);
+            while let Some(current) = queue.pop_front() {
+                if let Some(neighbors) = adj.get(&current) {
+                    for &n in neighbors {
+                        if !visited.contains(&n) {
+                            visited.insert(n);
+                            queue.push_back(n);
+                        }
+                    }
+                }
+            }
+        }
+        num
+    };
+
+    let baseline = count_components(None);
+
+    // Users to test: those with outgoing edges.
+    let candidate_ids = db.get_users_with_outgoing_ids()?;
+    let total = candidate_ids.len();
+
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
+        ProgressStyle::with_template("🌉 {msg} [{bar:30}] {pos}/{len}  {eta}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message("计算桥梁节点".to_string());
+
+    let mut bridges: Vec<Bridge> = Vec::new();
+
+    for &uid in &candidate_ids {
+        let after = count_components(Some(uid));
+        let impact = after.saturating_sub(baseline);
+
+        if let Ok(Some(u)) = db.get_user_by_id(uid) {
+            let following = u.following;
+            let followers = u.followers;
+            bridges.push(Bridge {
+                login: u.login,
+                following,
+                followers,
+                impact,
+            });
+        }
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+
+    // Sort by impact descending.
+    bridges.sort_by_key(|b| std::cmp::Reverse(b.impact));
+    if limit > 0 && bridges.len() > limit {
+        bridges.truncate(limit);
+    }
+
+    Ok(BridgesResult {
+        baseline_components: baseline,
+        bridges,
     })
 }
 

@@ -62,7 +62,7 @@ pub enum DbError {
 // ---------------------------------------------------------------------------
 
 pub struct Db {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Db {
@@ -742,6 +742,25 @@ impl Db {
             0.0
         };
         Ok((num_components, ratio))
+    }
+
+    /// Number of users that `user_id` follows.
+    pub fn get_following_count(&self, user_id: i64) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE from_user_id = ?1 AND edge_type = 'follows'",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// All user IDs that have at least one outgoing follows edge.
+    pub fn get_users_with_outgoing_ids(&self) -> Result<Vec<i64>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT from_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 
