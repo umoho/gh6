@@ -265,7 +265,7 @@ fn progress_line(s: &StatusData) -> String {
         );
     }
     let cc = s.currently_crawling.as_deref().unwrap_or("-");
-    let api_val = format!("{}/5000", s.api_remaining);
+    let api_val = format!("{}/{}", s.api_remaining, s.api_limit);
 
     // Compute plain-text widths for padding (before colorizing)
     let deg = format!("{}°", s.current_degree);
@@ -342,7 +342,11 @@ fn print_status(data: &StatusData, json: bool) {
         return;
     }
 
-    let api_str = format!("{} / 5,000", fmt_thousands(data.api_remaining as u64));
+    let api_str = format!(
+        "{} / {}",
+        fmt_thousands(data.api_remaining as u64),
+        fmt_thousands(data.api_limit as u64)
+    );
     let currently = data
         .currently_crawling
         .as_deref()

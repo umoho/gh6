@@ -24,6 +24,7 @@ struct ServerState {
     currently_crawling: RwLock<Option<String>>,
     current_degree: AtomicI32,
     api_remaining: AtomicU32,
+    api_limit: AtomicU32,
     api_reset_at: AtomicI64,
     started_at: Instant,
     shutdown: AtomicBool,
@@ -37,6 +38,7 @@ impl ServerState {
             currently_crawling: RwLock::new(None),
             current_degree: AtomicI32::new(0),
             api_remaining: AtomicU32::new(0),
+            api_limit: AtomicU32::new(5000),
             api_reset_at: AtomicI64::new(0),
             started_at: Instant::now(),
             shutdown: AtomicBool::new(false),
@@ -120,6 +122,7 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     {
         let rl = client.rate_limit();
         state.api_remaining.store(rl.remaining, Ordering::SeqCst);
+        state.api_limit.store(rl.limit, Ordering::SeqCst);
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
     }
 
@@ -329,6 +332,7 @@ async fn crawl_loop(
 
         let rl = client.rate_limit();
         state.api_remaining.store(rl.remaining, Ordering::SeqCst);
+        state.api_limit.store(rl.limit, Ordering::SeqCst);
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
 
         *state.currently_crawling.write().await = None;
@@ -531,6 +535,7 @@ fn build_status_data(
     let users_queued = db.pending_scopes(crawler_name, 10_000_000)?.len() as u64;
     let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
+    let api_limit = state.api_limit.load(Ordering::SeqCst);
     let api_reset_at = state.api_reset_at.load(Ordering::SeqCst);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let paused = state.paused.load(Ordering::SeqCst);
@@ -540,6 +545,7 @@ fn build_status_data(
         users_queued,
         current_degree,
         api_remaining,
+        api_limit,
         api_reset_at,
         uptime_secs,
         currently_crawling,

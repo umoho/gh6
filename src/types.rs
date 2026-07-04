@@ -23,6 +23,8 @@ pub struct GithubUser {
 
 #[derive(Debug, Clone)]
 pub struct RateLimit {
+    pub limit: u32,
+    /// Remaining requests in the current window.
     pub remaining: u32,
     /// Unix timestamp (seconds) when the rate limit window resets.
     pub reset_at: i64,
@@ -96,6 +98,7 @@ pub struct StatusData {
     pub users_queued: u64,
     pub current_degree: i32,
     pub api_remaining: u32,
+    pub api_limit: u32,
     pub api_reset_at: i64,
     pub uptime_secs: u64,
     pub currently_crawling: Option<String>,

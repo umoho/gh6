@@ -37,6 +37,7 @@ pub trait GithubApi: Send + Sync {
 
 #[derive(Debug, Deserialize)]
 struct GhRateLimit {
+    limit: u32,
     remaining: u32,
     reset: i64,
 }
@@ -107,6 +108,7 @@ impl GhClient {
 
         let client = Self {
             rate_limit: Arc::new(Mutex::new(RateLimit {
+                limit: 5000,
                 remaining: 5000,
                 reset_at: 0,
             })),
@@ -147,6 +149,7 @@ impl GhClient {
             && let Ok(rl) = serde_json::from_str::<GhRateLimit>(&json)
             && let Ok(mut guard) = self.rate_limit.lock()
         {
+            guard.limit = rl.limit;
             guard.remaining = rl.remaining;
             guard.reset_at = rl.reset;
         }
