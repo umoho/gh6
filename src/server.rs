@@ -440,6 +440,20 @@ async fn handle_status_watch(
             Err(_) => {}
         }
 
+        // Send fresh status snapshot so the client progress bar stays current
+        {
+            let db_guard = db.lock().await;
+            let currently_crawling = state.currently_crawling.read().await.clone();
+            let data = build_status_data(&state, &db_guard, currently_crawling, crawler_name)?;
+            let response = ServerResponse::Ok {
+                data: Some(serde_json::to_value(data)?),
+            };
+            let json = serde_json::to_string(&response)? + "\n";
+            if writer.write_all(json.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+
         if state.shutdown.load(Ordering::SeqCst) {
             let response = ServerResponse::Bye;
             let json = serde_json::to_string(&response)? + "\n";
