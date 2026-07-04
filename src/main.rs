@@ -1133,7 +1133,7 @@ fn print_all_paths(paths: &AllPathsResult, json: bool, with_profile: bool, with_
     }
 }
 
-fn print_communities(result: &CommunitiesResult, json: bool) {
+fn print_communities(result: &CommunitiesResult, json: bool, limit: usize) {
     if json {
         println!("{}", serde_json::to_string(result).unwrap());
         return;
@@ -1149,11 +1149,12 @@ fn print_communities(result: &CommunitiesResult, json: bool) {
         );
         println!();
         println!("  同社区成员:");
-        for m in members.iter().take(30) {
+        let max = if limit == 0 { members.len() } else { limit };
+        for m in members.iter().take(max) {
             println!("    {m}");
         }
-        if members.len() > 30 {
-            println!("    ... 还有 {} 人", members.len() - 30);
+        if members.len() > max {
+            println!("    ... 还有 {} 人", members.len() - max);
         }
         return;
     }
@@ -1382,7 +1383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     }
                     let result = analyze::cmd_communities(&db, limit, user.as_deref())?;
-                    print_communities(&result, cli.json);
+                    print_communities(&result, cli.json, limit);
                 }
                 AnalyzeCommand::Stats => {
                     let stats = analyze::cmd_stats(&db)?;
