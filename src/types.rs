@@ -34,7 +34,7 @@ pub struct RateLimit {
 // Database types (produced by db.rs, consumed by crawlers & analyze)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct User {
     pub id: i64,

@@ -230,6 +230,16 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Check whether a `follows` edge exists from `from_id` to `to_id`.
+    pub fn has_follows_edge(&self, from_id: i64, to_id: i64) -> Result<bool, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE from_user_id = ?1 AND to_user_id = ?2 AND edge_type = 'follows'",
+            params![from_id, to_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     // -----------------------------------------------------------------------
     // Path finding
     // -----------------------------------------------------------------------
@@ -641,6 +651,97 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![user1_id, user2_id], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Graph statistics
+    // -----------------------------------------------------------------------
+
+    /// Total number of `follows` edges.
+    pub fn get_edge_count(&self) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'follows'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Number of distinct users that have at least one outgoing follows edge.
+    pub fn get_users_with_outgoing(&self) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT from_user_id) FROM edges WHERE edge_type = 'follows'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Number of distinct users that have at least one incoming follows edge.
+    pub fn get_users_with_incoming(&self) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT to_user_id) FROM edges WHERE edge_type = 'follows'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Weakly-connected-components analysis.
+    ///
+    /// Returns `(num_components, largest_component_ratio)` where the ratio
+    /// is `largest_size / total_users`.
+    pub fn connected_components_info(&self) -> Result<(usize, f64), DbError> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let total_users = self.get_user_count()?;
+
+        // Build undirected adjacency list.
+        let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        for pair in rows {
+            let (a, b) = pair?;
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+
+        let all_users = self.get_all_users()?;
+        let mut visited = HashSet::new();
+        let mut components: Vec<usize> = Vec::new();
+
+        for user in &all_users {
+            if visited.contains(&user.id) {
+                continue;
+            }
+            let mut size = 0usize;
+            let mut queue = VecDeque::new();
+            queue.push_back(user.id);
+            visited.insert(user.id);
+            while let Some(current) = queue.pop_front() {
+                size += 1;
+                if let Some(neighbors) = adj.get(&current) {
+                    for &n in neighbors {
+                        if !visited.contains(&n) {
+                            visited.insert(n);
+                            queue.push_back(n);
+                        }
+                    }
+                }
+            }
+            components.push(size);
+        }
+
+        let num_components = components.len();
+        let largest = components.iter().max().copied().unwrap_or(0) as f64;
+        let ratio = if total_users > 0 {
+            largest / total_users as f64
+        } else {
+            0.0
+        };
+        Ok((num_components, ratio))
     }
 }
 

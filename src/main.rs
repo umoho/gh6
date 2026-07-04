@@ -12,7 +12,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
-use gh6::analyze::{self, AllPathsResult, CommonResult, FuzzyPathResult, UserProfileResult};
+use gh6::analyze::{
+    self, AllPathsResult, CommonResult, FuzzyPathResult, PathInfo, StatsResult, UserProfileResult,
+};
 use gh6::db::Db;
 use gh6::types::*;
 
@@ -83,8 +85,6 @@ enum AnalyzeCommand {
     },
     /// Show a user's profile and social graph
     User { login: String },
-    /// Show distribution of users by BFS degree
-    DegreeDist,
     /// Show offline database overview
     Stats,
     /// Export the graph to a JSON file
@@ -445,29 +445,54 @@ fn print_event(resp: &ServerResponse, _has_progress: bool) {
     }
 }
 
-fn print_path(path: &[User], json: bool) {
+fn print_path(info: &PathInfo, json: bool) {
     if json {
-        let logins: Vec<&str> = path.iter().map(|u| u.login.as_str()).collect();
-        println!("{}", serde_json::to_string(&logins).unwrap());
+        let logins: Vec<&str> = info.path.iter().map(|u| u.login.as_str()).collect();
+        let edges: Vec<serde_json::Value> = info
+            .directed_edges
+            .iter()
+            .map(|e| serde_json::json!({"from": e.from, "to": e.to}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": logins,
+                "steps": info.path.len() - 1,
+                "directed_edges": edges
+            })
+        );
         return;
     }
-    let route: Vec<String> = path
+
+    let route: Vec<String> = info
+        .path
         .iter()
         .enumerate()
         .map(|(i, u)| {
             if i == 0 {
                 u.login.bold().to_string()
-            } else if i == path.len() - 1 {
+            } else if i == info.path.len() - 1 {
                 u.login.green().bold().to_string()
             } else {
                 u.login.to_string()
             }
         })
         .collect();
-    let arrow = "→".dimmed();
-    let steps = path.len() - 1;
-    println!("{}", route.join(&format!(" {arrow} ")));
-    println!("({steps} 步)");
+    let sep = "·".dimmed();
+    let steps = info.path.len() - 1;
+    println!("路径: {}  ({steps} 步)", route.join(&format!(" {sep} ")));
+
+    if !info.directed_edges.is_empty() {
+        println!();
+        println!("  有向边:");
+        let arrow = "→".dimmed();
+        for e in &info.directed_edges {
+            println!("    {} {arrow} {}", e.from, e.to);
+        }
+    } else if steps > 0 {
+        println!();
+        println!("  （无已知方向）");
+    }
 }
 
 fn print_common(result: &CommonResult, json: bool, show_following: bool, show_followers: bool) {
@@ -629,60 +654,35 @@ fn print_user(result: &UserProfileResult, json: bool) {
     }
 }
 
-fn print_degree_dist(dist: &[DegreeDist], json: bool) {
+fn print_stats(s: &StatsResult, json: bool) {
     if json {
-        println!("{}", serde_json::to_string(dist).unwrap());
+        println!("{}", serde_json::to_string(s).unwrap());
         return;
     }
 
-    let max_count = dist.iter().map(|d| d.count).max().unwrap_or(1) as u64;
-    let bar_width = 40usize;
-
-    println!("{}", "度数分布".bold());
-    println!("{}", "────────".dimmed());
-
-    for d in dist {
-        let b = bar(d.count as u64, max_count, bar_width);
-        let cnt = fmt_thousands(d.count as u64);
-        println!(
-            "  {:>3}°  {:>6}  {}",
-            d.degree.to_string().cyan(),
-            cnt,
-            b.dimmed()
-        );
-    }
-}
-
-fn print_stats(
-    total: u64,
-    crawled: u64,
-    pending: u64,
-    min_deg: i32,
-    max_deg: i32,
-    file_size: u64,
-    dist: &[DegreeDist],
-) {
-    let size_str = if file_size > 1_000_000 {
-        format!("{:.1} MB", file_size as f64 / 1_000_000.0)
+    let size_str = if s.file_size_bytes > 1_000_000 {
+        format!("{:.1} MB", s.file_size_bytes as f64 / 1_000_000.0)
     } else {
-        format!("{} KB", file_size / 1000)
+        format!("{} KB", s.file_size_bytes / 1000)
     };
 
     println!("{}", "📊 gh6 数据库概况".bold());
     println!("{}", "────────────────".dimmed());
-    println!("  用户总数    {}", fmt_thousands(total));
+    println!("  用户总数    {}", fmt_thousands(s.total_users));
     println!(
         "  已爬 / 排队 {}/ {}",
-        fmt_thousands(crawled),
-        fmt_thousands(pending)
+        fmt_thousands(s.crawled),
+        fmt_thousands(s.pending)
     );
-    println!("  度数范围    {min_deg}° ~ {max_deg}°");
+    println!("  度数范围    {}° ~ {}°", s.min_degree, s.max_degree);
     println!("  数据库      {size_str}");
     println!();
+
+    // Degree distribution
     println!("{}", "度数分布".bold());
     println!("{}", "────────".dimmed());
-    let max_count = dist.iter().map(|d| d.count).max().unwrap_or(1) as u64;
-    for d in dist {
+    let max_count = s.degree_dist.iter().map(|d| d.count).max().unwrap_or(1) as u64;
+    for d in &s.degree_dist {
         let b = bar(d.count as u64, max_count, 30);
         let cnt = fmt_thousands(d.count as u64);
         println!(
@@ -692,16 +692,49 @@ fn print_stats(
             b.dimmed()
         );
     }
+    println!();
+
+    // Graph statistics
+    println!("{}", "图统计".bold());
+    println!("{}", "──────".dimmed());
+    println!("  边数             {}", fmt_thousands(s.total_edges));
+    println!("  图密度           {:.6}", s.density);
+    println!(
+        "  连通分量数       {}",
+        fmt_thousands(s.connected_components as u64)
+    );
+    println!(
+        "  最大分量占比     {:.1}%",
+        s.largest_component_ratio * 100.0
+    );
+    println!("  平均出度         {:.2}", s.avg_out_degree);
+    println!("  平均入度         {:.2}", s.avg_in_degree);
+    println!(
+        "  有出边的用户     {}",
+        fmt_thousands(s.users_with_outgoing)
+    );
+    println!(
+        "  有入边的用户     {}",
+        fmt_thousands(s.users_with_incoming)
+    );
 }
 
 fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
     if json {
         let out: Vec<serde_json::Value> = results
             .iter()
-            .map(|(u, path)| {
+            .map(|(u, info)| {
+                let logins: Vec<&str> = info.path.iter().map(|p| p.login.as_str()).collect();
+                let edges: Vec<serde_json::Value> = info
+                    .directed_edges
+                    .iter()
+                    .map(|e| serde_json::json!({"from": e.from, "to": e.to}))
+                    .collect();
                 serde_json::json!({
                     "login": u.login,
-                    "path": path.iter().map(|p| &p.login).collect::<Vec<_>>()
+                    "path": logins,
+                    "steps": info.path.len() - 1,
+                    "directed_edges": edges
                 })
             })
             .collect();
@@ -709,56 +742,82 @@ fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool) {
         return;
     }
 
-    for (i, (_user, path)) in results.iter().enumerate() {
-        let arrow = "→".dimmed();
-        let route: Vec<String> = path
+    let sep = "·".dimmed();
+    for (i, (_user, info)) in results.iter().enumerate() {
+        let route: Vec<String> = info
+            .path
             .iter()
             .enumerate()
             .map(|(j, u)| {
                 if j == 0 {
                     u.login.bold().to_string()
-                } else if j == path.len() - 1 {
+                } else if j == info.path.len() - 1 {
                     u.login.green().bold().to_string()
                 } else {
                     u.login.to_string()
                 }
             })
             .collect();
-        let steps = path.len() - 1;
+        let steps = info.path.len() - 1;
         let s = format!("{:>2}.", i + 1);
         let idx = s.dimmed();
-        println!("{idx} {} ({steps} 步)", route.join(&format!(" {arrow} ")));
+        println!("{idx} {} ({steps} 步)", route.join(&format!(" {sep} ")));
+        if !info.directed_edges.is_empty() {
+            let arrow = "→".dimmed();
+            for e in &info.directed_edges {
+                println!("       {} {arrow} {}", e.from, e.to);
+            }
+        }
     }
 }
 
 fn print_all_paths(paths: &AllPathsResult, json: bool) {
     if json {
-        let out: Vec<Vec<&str>> = paths
+        let out: Vec<serde_json::Value> = paths
             .iter()
-            .map(|p| p.iter().map(|u| u.login.as_str()).collect())
+            .map(|info| {
+                let logins: Vec<&str> = info.path.iter().map(|u| u.login.as_str()).collect();
+                let edges: Vec<serde_json::Value> = info
+                    .directed_edges
+                    .iter()
+                    .map(|e| serde_json::json!({"from": e.from, "to": e.to}))
+                    .collect();
+                serde_json::json!({
+                    "path": logins,
+                    "steps": info.path.len() - 1,
+                    "directed_edges": edges
+                })
+            })
             .collect();
         println!("{}", serde_json::to_string(&out).unwrap());
         return;
     }
-    let arrow = "→".dimmed();
-    for (i, path) in paths.iter().enumerate() {
-        let route: Vec<String> = path
+    let sep = "·".dimmed();
+    for (i, info) in paths.iter().enumerate() {
+        let route: Vec<String> = info
+            .path
             .iter()
             .enumerate()
             .map(|(j, u)| {
                 if j == 0 {
                     u.login.bold().to_string()
-                } else if j == path.len() - 1 {
+                } else if j == info.path.len() - 1 {
                     u.login.green().bold().to_string()
                 } else {
                     u.login.to_string()
                 }
             })
             .collect();
-        let steps = path.len() - 1;
+        let steps = info.path.len() - 1;
         let s = format!("{:>3}.", i + 1);
         let idx = s.dimmed();
-        println!("{idx} {} ({steps} 步)", route.join(&format!(" {arrow} ")));
+        println!("{idx} {} ({steps} 步)", route.join(&format!(" {sep} ")));
+        if !info.directed_edges.is_empty() {
+            let arrow = "→".dimmed();
+            for e in &info.directed_edges {
+                println!("       {} {arrow} {}", e.from, e.to);
+            }
+        }
     }
 }
 
@@ -924,45 +983,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let result = analyze::cmd_user(&db, &login)?;
                     print_user(&result, cli.json);
                 }
-                AnalyzeCommand::DegreeDist => {
-                    let dist = analyze::cmd_degree_dist(&db)?;
-                    print_degree_dist(&dist, cli.json);
-                }
                 AnalyzeCommand::Stats => {
-                    let total_users = db.get_user_count()? as u64;
-                    let crawled = db.get_crawled_count("follow_crawler")? as u64;
-                    let pending = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
-                    let dist = db.degree_distribution()?;
-                    let min_degree = dist.first().map(|d| d.degree).unwrap_or(0);
-                    let max_degree = dist.last().map(|d| d.degree).unwrap_or(0);
-
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    let db_path = PathBuf::from(home).join(".local/share/gh6/gh6.db");
-                    let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "total_users": total_users,
-                                "crawled": crawled,
-                                "pending": pending,
-                                "min_degree": min_degree,
-                                "max_degree": max_degree,
-                                "file_size_bytes": file_size
-                            })
-                        );
-                    } else {
-                        print_stats(
-                            total_users,
-                            crawled,
-                            pending,
-                            min_degree,
-                            max_degree,
-                            file_size,
-                            &dist,
-                        );
-                    }
+                    let stats = analyze::cmd_stats(&db)?;
+                    print_stats(&stats, cli.json);
                 }
                 AnalyzeCommand::Export { file } => {
                     let (users, edges) = analyze::cmd_export(&db, &file)?;

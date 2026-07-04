@@ -51,36 +51,103 @@ pub struct UserProfileResult {
     pub followers: Vec<String>,
 }
 
+/// A directed follows edge between two users.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DirectedEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// A graph path with annotated directed edges.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PathInfo {
+    pub path: Vec<User>,
+    pub directed_edges: Vec<DirectedEdge>,
+}
+
+/// Aggregate statistics returned by [`cmd_stats`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsResult {
+    pub total_users: u64,
+    pub crawled: u64,
+    pub pending: u64,
+    pub min_degree: i32,
+    pub max_degree: i32,
+    pub file_size_bytes: u64,
+    pub degree_dist: Vec<DegreeDist>,
+    pub total_edges: u64,
+    pub density: f64,
+    pub connected_components: usize,
+    pub largest_component_ratio: f64,
+    pub avg_out_degree: f64,
+    pub avg_in_degree: f64,
+    pub users_with_outgoing: u64,
+    pub users_with_incoming: u64,
+}
+
 // ---------------------------------------------------------------------------
 // cmd_path
 // ---------------------------------------------------------------------------
 
 /// Find the shortest path between `from` and `to` through the social graph.
 ///
-/// Returns `Ok(None)` when no path exists, or `Ok(Some(path))` with the
-/// ordered list of users from `from` to `to` (inclusive).
-pub fn cmd_path(db: &Db, from: &str, to: &str) -> Result<Option<Vec<User>>, Box<dyn Error>> {
+/// Returns `Ok(None)` when no path exists.
+pub fn cmd_path(db: &Db, from: &str, to: &str) -> Result<Option<PathInfo>, Box<dyn Error>> {
     let path = db.get_shortest_path(from, to)?;
     if path.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(path))
+        let directed_edges = path_directed_edges(db, &path)?;
+        Ok(Some(PathInfo {
+            path,
+            directed_edges,
+        }))
     }
 }
 
-pub type AllPathsResult = Vec<Vec<User>>;
+/// Find all follows edges along a path produced by undirected BFS.
+fn path_directed_edges(db: &Db, path: &[User]) -> Result<Vec<DirectedEdge>, Box<dyn Error>> {
+    let mut edges = Vec::new();
+    for w in path.windows(2) {
+        let a = &w[0];
+        let b = &w[1];
+        if db.has_follows_edge(a.id, b.id)? {
+            edges.push(DirectedEdge {
+                from: a.login.clone(),
+                to: b.login.clone(),
+            });
+        } else if db.has_follows_edge(b.id, a.id)? {
+            edges.push(DirectedEdge {
+                from: b.login.clone(),
+                to: a.login.clone(),
+            });
+        }
+    }
+    Ok(edges)
+}
 
-/// Find all paths between two users (DFS, depth-limited to 6, max 50 paths).
+pub type AllPathsResult = Vec<PathInfo>;
+
+/// Find all paths between two users (DFS, depth-limited to 6).
 pub fn cmd_all_paths(
     db: &Db,
     from: &str,
     to: &str,
     limit: usize,
 ) -> Result<AllPathsResult, Box<dyn Error>> {
-    Ok(db.get_all_paths(from, to, limit)?)
+    let paths = db.get_all_paths(from, to, limit)?;
+    let mut result = Vec::with_capacity(paths.len());
+    for path in paths {
+        let directed_edges = path_directed_edges(db, &path)?;
+        result.push(PathInfo {
+            path,
+            directed_edges,
+        });
+    }
+    Ok(result)
 }
 
-pub type FuzzyPathResult = Vec<(User, Vec<User>)>;
+pub type FuzzyPathResult = Vec<(User, PathInfo)>;
 
 /// Fuzzy search: find paths from seed to all users matching the query.
 pub fn cmd_fuzzy_path(db: &Db, from: &str, q: &str) -> Result<FuzzyPathResult, Box<dyn Error>> {
@@ -89,7 +156,14 @@ pub fn cmd_fuzzy_path(db: &Db, from: &str, q: &str) -> Result<FuzzyPathResult, B
     for user in matches {
         let path = db.get_shortest_path(from, &user.login)?;
         if !path.is_empty() {
-            results.push((user, path));
+            let directed_edges = path_directed_edges(db, &path)?;
+            results.push((
+                user,
+                PathInfo {
+                    path,
+                    directed_edges,
+                },
+            ));
         }
     }
     Ok(results)
@@ -234,6 +308,58 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
 /// BFS degree level in the edges table.
 pub fn cmd_degree_dist(db: &Db) -> Result<Vec<DegreeDist>, Box<dyn Error>> {
     Ok(db.degree_distribution()?)
+}
+
+// ---------------------------------------------------------------------------
+// cmd_stats
+// ---------------------------------------------------------------------------
+
+/// Compute aggregate statistics for the social graph.
+pub fn cmd_stats(db: &Db) -> Result<StatsResult, Box<dyn Error>> {
+    let total_users = db.get_user_count()? as u64;
+    let crawled = db.get_crawled_count("follow_crawler")? as u64;
+    let pending = db.pending_scopes("follow_crawler", 10_000_000)?.len() as u64;
+    let dist = db.degree_distribution()?;
+    let min_degree = dist.first().map(|d| d.degree).unwrap_or(0);
+    let max_degree = dist.last().map(|d| d.degree).unwrap_or(0);
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let db_path = std::path::PathBuf::from(home).join(".local/share/gh6/gh6.db");
+    let file_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    let total_edges = db.get_edge_count()? as u64;
+    let density = if total_users > 1 {
+        total_edges as f64 / (total_users as f64 * (total_users as f64 - 1.0))
+    } else {
+        0.0
+    };
+    let (connected_components, largest_component_ratio) = db.connected_components_info()?;
+    let avg_out_degree = if total_users > 0 {
+        total_edges as f64 / total_users as f64
+    } else {
+        0.0
+    };
+    let avg_in_degree = avg_out_degree;
+    let users_with_outgoing = db.get_users_with_outgoing()? as u64;
+    let users_with_incoming = db.get_users_with_incoming()? as u64;
+
+    Ok(StatsResult {
+        total_users,
+        crawled,
+        pending,
+        min_degree,
+        max_degree,
+        file_size_bytes,
+        degree_dist: dist,
+        total_edges,
+        density,
+        connected_components,
+        largest_component_ratio,
+        avg_out_degree,
+        avg_in_degree,
+        users_with_outgoing,
+        users_with_incoming,
+    })
 }
 
 // ---------------------------------------------------------------------------
