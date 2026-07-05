@@ -358,9 +358,9 @@ async fn crawl_loop(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to fetch profile for {scope}: {e}, skipping");
+                    warn!("Failed to fetch profile for {scope}: {e}, retrying…");
                     let db_guard = db.lock().await;
-                    let _ = db_guard.mark_crawl_done(crawler_name, &scope);
+                    let _ = db_guard.reset_to_retry(&scope, &e.to_string());
                     drop(db_guard);
                     *state.currently_crawling.write().await = None;
                     continue;
