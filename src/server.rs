@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -309,11 +309,19 @@ async fn crawl_loop(
             None
         };
 
+        debug!(
+            "profile check for {scope}: has_profile={}, following_count={:?}",
+            following_count.is_some(),
+            following_count
+        );
+
         if following_count.is_none() {
             // Profile missing — fetch it.
+            debug!("fetching profile for {scope}…");
             match client.get_user(&scope).await {
                 Ok(profile) => {
                     let count = profile.following;
+                    debug!("got profile for {scope}: following={count}");
                     let db_guard = db.lock().await;
                     let uid = db_guard.insert_user(&profile.login).unwrap_or(0);
                     if uid > 0 {
@@ -339,6 +347,11 @@ async fn crawl_loop(
                     continue;
                 }
             }
+        } else {
+            debug!(
+                "profile already cached for {scope}, following_count={}",
+                following_count.unwrap_or(0)
+            );
         }
 
         let degree = {

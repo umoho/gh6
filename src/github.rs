@@ -1,4 +1,5 @@
 use crate::types::{GithubUserProfile, GithubUserSummary, RateLimit};
+use log::{debug, trace};
 use serde::Deserialize;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -168,9 +169,12 @@ impl GhClient {
             && let Ok(rl) = serde_json::from_str::<GhRateLimit>(&json)
             && let Ok(mut guard) = self.rate_limit.lock()
         {
+            trace!("rate-limit refreshed: {}/{}", rl.remaining, rl.limit);
             guard.limit = rl.limit;
             guard.remaining = rl.remaining;
             guard.reset_at = rl.reset;
+        } else {
+            debug!("rate-limit refresh failed (best-effort, ignoring)");
         }
     }
 }
@@ -190,17 +194,28 @@ impl GithubApi for GhClient {
         // large following lists don't block the crawl loop indefinitely.
         // Each page is fetched individually, allowing rate-limit refreshes
         // and external visibility of progress between pages.
+        debug!("get_following({login}): starting manual pagination");
         loop {
+            trace!("get_following({login}): fetching page {page}");
             let json = self
                 .gh(&[&format!(
                     "/users/{login}/following?page={page}&per_page=100"
                 )])
                 .await?;
             let batch: Vec<GhUserSummary> = serde_json::from_str(&json)?;
+            let batch_size = batch.len();
             if batch.is_empty() {
+                debug!(
+                    "get_following({login}): page {page} empty, done. total={}",
+                    users.len()
+                );
                 break;
             }
             users.extend(batch.into_iter().map(GithubUserSummary::from));
+            debug!(
+                "get_following({login}): page {page} -> {batch_size} users, total={}",
+                users.len()
+            );
             self.refresh_rate_limit().await;
             page += 1;
         }

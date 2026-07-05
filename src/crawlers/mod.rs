@@ -1,3 +1,4 @@
+use log::debug;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -59,6 +60,7 @@ impl FollowCrawler {
         login: &str,
         current_degree: i32,
     ) -> Result<CrawlResult, CrawlerError> {
+        debug!("crawl_following({login}): degree={current_degree}, fetching following…");
         // Phase 1: read user id from DB (lock held briefly)
         let from_user_id = {
             let db_guard = db.lock().await;
@@ -70,6 +72,10 @@ impl FollowCrawler {
 
         // Phase 2: HTTP request (lock NOT held — this is the await point)
         let following: Vec<GithubUserSummary> = client.get_following(login).await?;
+        debug!(
+            "crawl_following({login}): got {} following, persisting to DB…",
+            following.len()
+        );
 
         // Phase 3: persist results to DB (lock held for bulk writes)
         let next_degree = current_degree + 1;
