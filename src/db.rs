@@ -2,47 +2,7 @@ use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::types::{DegreeDist, Edge, GithubUser, NewEdge, User};
-
-// ---------------------------------------------------------------------------
-// Migration SQL (embedded, not read from file at runtime)
-// ---------------------------------------------------------------------------
-
-const MIGRATION_SQL: &str = "
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY,
-    login         TEXT NOT NULL UNIQUE,
-    name          TEXT,
-    avatar_url    TEXT,
-    company       TEXT,
-    location      TEXT,
-    followers     INTEGER,
-    following     INTEGER,
-    public_repos  INTEGER,
-    created_at    TEXT,
-    updated_at    TEXT
-);
-
-CREATE TABLE IF NOT EXISTS edges (
-    from_user_id   INTEGER NOT NULL REFERENCES users(id),
-    to_user_id     INTEGER NOT NULL REFERENCES users(id),
-    edge_type      TEXT NOT NULL,
-    weight         REAL DEFAULT 1.0,
-    degree         INTEGER,
-    metadata       TEXT,
-    discovered_at  TEXT DEFAULT (datetime('now')),
-    PRIMARY KEY (from_user_id, to_user_id, edge_type)
-);
-
-CREATE TABLE IF NOT EXISTS crawl_state (
-    crawler_name   TEXT NOT NULL,
-    scope_key      TEXT NOT NULL,
-    status         TEXT DEFAULT 'pending',
-    last_error     TEXT,
-    crawled_at     TEXT,
-    PRIMARY KEY (crawler_name, scope_key)
-);
-";
+use crate::types::{DegreeDist, Edge, GithubUserProfile, NewEdge, User};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -79,53 +39,83 @@ impl Db {
         // Enable WAL mode for better concurrent read/write performance
         conn.execute_batch("PRAGMA journal_mode=WAL")?;
 
-        // Run migrations (idempotent — ignore duplicate-column errors)
-        conn.execute_batch(MIGRATION_SQL)?;
-        if let Err(e) = conn.execute_batch(include_str!("../migrations/002_priority.sql")) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(e.into());
-            }
-        }
+        // Run migrations
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
 
         Ok(Self { conn })
     }
 
     // -----------------------------------------------------------------------
-    // User methods
+    // User identity methods (stable layer — users table)
     // -----------------------------------------------------------------------
 
-    /// Insert or replace a user. Returns the row id of the inserted/updated user.
-    pub fn upsert_user(&self, u: &GithubUser) -> Result<i64, DbError> {
+    /// Insert a login into `users` if not already present.
+    /// Returns the user's id (existing or new).
+    pub fn insert_user(&self, login: &str) -> Result<i64, DbError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO users (id, login, name, avatar_url, company, location, \
-             followers, following, public_repos, created_at, updated_at) \
-             VALUES ( \
-               (SELECT id FROM users WHERE login = ?1), \
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
-             )",
-            params![
-                u.login,
-                u.name,
-                u.avatar_url,
-                u.company,
-                u.location,
-                u.followers,
-                u.following,
-                u.public_repos,
-                u.created_at,
-                u.updated_at,
-            ],
+            "INSERT OR IGNORE INTO users (login) VALUES (?1)",
+            params![login],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM users WHERE login = ?1",
+            params![login],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
+    // -----------------------------------------------------------------------
+    // Profile methods (extension layer — user_profiles table)
+    // -----------------------------------------------------------------------
+
+    /// Insert or replace a full user profile.
+    pub fn upsert_profile(&self, user_id: i64, profile: &GithubUserProfile) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO user_profiles \
+             (user_id, name, avatar_url, company, location, \
+              followers, following, public_repos, created_at, updated_at, fetched_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+            params![
+                user_id,
+                profile.name,
+                profile.avatar_url,
+                profile.company,
+                profile.location,
+                profile.followers,
+                profile.following,
+                profile.public_repos,
+                profile.created_at,
+                profile.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Check whether a profile exists for this user.
+    pub fn has_profile(&self, user_id: i64) -> Result<bool, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM user_profiles WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // User query methods (JOIN users + user_profiles)
+    // -----------------------------------------------------------------------
+
     /// Look up a user by login. Returns `None` if not found.
+    /// Profile fields are `None` when no row exists in `user_profiles`.
     pub fn get_user_by_login(&self, login: &str) -> Result<Option<User>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, login, name, avatar_url, company, location, \
-             followers, following, public_repos, created_at, updated_at \
-             FROM users WHERE login = ?1",
+            "SELECT u.id, u.login, \
+                    up.name, up.avatar_url, up.company, up.location, \
+                    up.followers, up.following, up.public_repos, \
+                    up.created_at, up.updated_at \
+             FROM users u \
+             LEFT JOIN user_profiles up ON u.id = up.user_id \
+             WHERE u.login = ?1",
         )?;
 
         let mut rows = stmt.query_map(params![login], |row| {
@@ -162,10 +152,14 @@ impl Db {
     pub fn search_users(&self, q: &str) -> Result<Vec<User>, DbError> {
         let pattern = format!("%{q}%");
         let mut stmt = self.conn.prepare(
-            "SELECT id, login, name, avatar_url, company, location, \
-             followers, following, public_repos, created_at, updated_at \
-             FROM users WHERE login LIKE ?1 ESCAPE '\\' \
-             ORDER BY CASE WHEN login LIKE ?2 THEN 0 ELSE 1 END, login \
+            "SELECT u.id, u.login, \
+                    up.name, up.avatar_url, up.company, up.location, \
+                    up.followers, up.following, up.public_repos, \
+                    up.created_at, up.updated_at \
+             FROM users u \
+             LEFT JOIN user_profiles up ON u.id = up.user_id \
+             WHERE u.login LIKE ?1 ESCAPE '\\' \
+             ORDER BY CASE WHEN u.login LIKE ?2 THEN 0 ELSE 1 END, u.login \
              LIMIT 20",
         )?;
         let prefix = format!("{q}%");
@@ -187,32 +181,164 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Look up a user by primary-key id.
+    pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.id, u.login, \
+                    up.name, up.avatar_url, up.company, up.location, \
+                    up.followers, up.following, up.public_repos, \
+                    up.created_at, up.updated_at \
+             FROM users u \
+             LEFT JOIN user_profiles up ON u.id = up.user_id \
+             WHERE u.id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                login: row.get(1)?,
+                name: row.get(2)?,
+                avatar_url: row.get(3)?,
+                company: row.get(4)?,
+                location: row.get(5)?,
+                followers: row.get(6)?,
+                following: row.get(7)?,
+                public_repos: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        match rows.next() {
+            Some(result) => Ok(Some(result?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Return every user in the database (with optional profile).
+    pub fn get_all_users(&self) -> Result<Vec<User>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.id, u.login, \
+                    up.name, up.avatar_url, up.company, up.location, \
+                    up.followers, up.following, up.public_repos, \
+                    up.created_at, up.updated_at \
+             FROM users u \
+             LEFT JOIN user_profiles up ON u.id = up.user_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                login: row.get(1)?,
+                name: row.get(2)?,
+                avatar_url: row.get(3)?,
+                company: row.get(4)?,
+                location: row.get(5)?,
+                followers: row.get(6)?,
+                following: row.get(7)?,
+                public_repos: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Config methods
+    // -----------------------------------------------------------------------
+
+    /// Read a config value. Returns `None` if the key does not exist.
+    pub fn get_config(&self, key: &str) -> Result<Option<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM config WHERE key = ?1")?;
+        let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(result) => Ok(Some(result?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Set (insert or replace) a config value.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Edge methods
     // -----------------------------------------------------------------------
 
-    /// Insert an edge. Uses INSERT OR IGNORE so duplicate edges are silently skipped.
+    /// Insert an edge. If the edge already exists, update `last_seen_at` and
+    /// set `is_active = 1`. On first insert, also write `edge_history`.
     pub fn insert_edge(&self, edge: &NewEdge) -> Result<(), DbError> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO edges (from_user_id, to_user_id, edge_type, weight, degree, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                edge.from_user_id,
-                edge.to_user_id,
-                edge.edge_type,
-                edge.weight,
-                edge.degree,
-                edge.metadata,
-            ],
+        let mut stmt = self.conn.prepare(
+            "SELECT is_active FROM edges \
+             WHERE from_user_id = ?1 AND to_user_id = ?2 AND edge_type = ?3",
         )?;
+        let existing: Option<bool> = stmt
+            .query_map(
+                params![edge.from_user_id, edge.to_user_id, edge.edge_type],
+                |row| row.get(0),
+            )?
+            .next()
+            .transpose()?;
+
+        match existing {
+            Some(true) => {
+                // Already active — just bump last_seen_at.
+                self.conn.execute(
+                    "UPDATE edges SET last_seen_at = datetime('now') \
+                     WHERE from_user_id = ?1 AND to_user_id = ?2 AND edge_type = ?3",
+                    params![edge.from_user_id, edge.to_user_id, edge.edge_type],
+                )?;
+            }
+            Some(false) => {
+                // Was removed, now back — reactivate.
+                self.conn.execute(
+                    "UPDATE edges SET is_active = 1, last_seen_at = datetime('now'), \
+                     removed_at = NULL \
+                     WHERE from_user_id = ?1 AND to_user_id = ?2 AND edge_type = ?3",
+                    params![edge.from_user_id, edge.to_user_id, edge.edge_type],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO edge_history (from_user_id, to_user_id, edge_type, action) \
+                     VALUES (?1, ?2, ?3, 'added')",
+                    params![edge.from_user_id, edge.to_user_id, edge.edge_type],
+                )?;
+            }
+            None => {
+                // Brand new edge.
+                self.conn.execute(
+                    "INSERT INTO edges (from_user_id, to_user_id, edge_type, weight, degree, \
+                     metadata, is_active) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        edge.from_user_id,
+                        edge.to_user_id,
+                        edge.edge_type,
+                        edge.weight,
+                        edge.degree,
+                        edge.metadata,
+                    ],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO edge_history (from_user_id, to_user_id, edge_type, action) \
+                     VALUES (?1, ?2, ?3, 'added')",
+                    params![edge.from_user_id, edge.to_user_id, edge.edge_type],
+                )?;
+            }
+        }
         Ok(())
     }
 
     /// Get all edges where the given user is either the source or target.
     pub fn get_edges_by_user(&self, user_id: i64) -> Result<Vec<Edge>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT from_user_id, to_user_id, edge_type, weight, degree, metadata, discovered_at \
-             FROM edges WHERE from_user_id = ?1 OR to_user_id = ?1",
+            "SELECT from_user_id, to_user_id, edge_type, weight, degree, metadata, \
+                    is_active, first_seen_at, last_seen_at, removed_at \
+             FROM edges WHERE (from_user_id = ?1 OR to_user_id = ?1) AND is_active = 1",
         )?;
 
         let rows = stmt.query_map(params![user_id], |row| {
@@ -223,7 +349,10 @@ impl Db {
                 weight: row.get(3)?,
                 degree: row.get(4)?,
                 metadata: row.get(5)?,
-                discovered_at: row.get(6)?,
+                is_active: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                removed_at: row.get(9)?,
             })
         })?;
 
@@ -233,7 +362,9 @@ impl Db {
     /// Check whether a `follows` edge exists from `from_id` to `to_id`.
     pub fn has_follows_edge(&self, from_id: i64, to_id: i64) -> Result<bool, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM edges WHERE from_user_id = ?1 AND to_user_id = ?2 AND edge_type = 'follows'",
+            "SELECT COUNT(*) FROM edges \
+             WHERE from_user_id = ?1 AND to_user_id = ?2 \
+               AND edge_type = 'follows' AND is_active = 1",
             params![from_id, to_id],
             |row| row.get(0),
         )?;
@@ -251,7 +382,6 @@ impl Db {
         from_login: &str,
         to_login: &str,
     ) -> Result<Vec<User>, DbError> {
-        // Resolve login -> id
         let from_user = self.get_user_by_login(from_login)?;
         let to_user = self.get_user_by_login(to_login)?;
 
@@ -264,27 +394,22 @@ impl Db {
             return Ok(vec![from_user.unwrap()]);
         }
 
-        // BFS on the edges table. We store (user_id, Vec<user_id> path so far).
         use std::collections::{HashMap, VecDeque};
 
-        // Build adjacency list from edges table (undirected — we follow edges in both directions)
         let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT from_user_id, to_user_id FROM edges")?;
-
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows' AND is_active = 1",
+        )?;
         let edge_rows =
             stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-
         for pair in edge_rows {
             let (a, b) = pair?;
             adj.entry(a).or_default().push(b);
             adj.entry(b).or_default().push(a);
         }
 
-        // BFS
         let mut queue = VecDeque::new();
-        let mut visited = HashMap::new(); // user_id -> predecessor user_id
+        let mut visited = HashMap::new();
         queue.push_back(from_id);
         visited.insert(from_id, from_id);
 
@@ -296,7 +421,6 @@ impl Db {
                     }
                     visited.insert(neighbor, current);
                     if neighbor == to_id {
-                        // Reconstruct path
                         let mut path_ids = Vec::new();
                         let mut cur = to_id;
                         loop {
@@ -308,29 +432,11 @@ impl Db {
                         }
                         path_ids.reverse();
 
-                        // Fetch user objects for each id
                         let mut path_users = Vec::with_capacity(path_ids.len());
                         for &uid in &path_ids {
-                            let mut stmt = self.conn.prepare(
-                                "SELECT id, login, name, avatar_url, company, location, \
-                                 followers, following, public_repos, created_at, updated_at \
-                                 FROM users WHERE id = ?1",
-                            )?;
-                            let u = stmt.query_row(params![uid], |row| {
-                                Ok(User {
-                                    id: row.get(0)?,
-                                    login: row.get(1)?,
-                                    name: row.get(2)?,
-                                    avatar_url: row.get(3)?,
-                                    company: row.get(4)?,
-                                    location: row.get(5)?,
-                                    followers: row.get(6)?,
-                                    following: row.get(7)?,
-                                    public_repos: row.get(8)?,
-                                    created_at: row.get(9)?,
-                                    updated_at: row.get(10)?,
-                                })
-                            })?;
+                            let u = self
+                                .get_user_by_id(uid)?
+                                .ok_or(DbError::Rusqlite(rusqlite::Error::QueryReturnedNoRows))?;
                             path_users.push(u);
                         }
                         return Ok(path_users);
@@ -366,15 +472,14 @@ impl Db {
 
         use std::collections::{HashMap, HashSet};
         let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT from_user_id, to_user_id FROM edges")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows' AND is_active = 1",
+        )?;
         for pair in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
             let (a, b) = pair?;
             adj.entry(a).or_default().push(b);
             adj.entry(b).or_default().push(a);
         }
-        // Cap neighbors per node to avoid explosion on hubs
         for v in adj.values_mut() {
             v.truncate(50);
         }
@@ -393,7 +498,6 @@ impl Db {
             &mut results,
         );
 
-        // Fetch users for each path
         let mut cache: HashMap<i64, User> = HashMap::new();
         let mut out = Vec::new();
         for path_ids in &results {
@@ -423,7 +527,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT degree, COUNT(DISTINCT from_user_id) \
              FROM edges \
-             WHERE degree IS NOT NULL \
+             WHERE degree IS NOT NULL AND is_active = 1 \
              GROUP BY degree \
              ORDER BY degree",
         )?;
@@ -442,23 +546,58 @@ impl Db {
     // Crawl state methods
     // -----------------------------------------------------------------------
 
-    /// Get pending scopes for a crawler, ordered by degree (ascending), limited.
-    /// The scope_key is the user login string.
+    /// Get pending scopes for a crawler using the three-tier strategy:
+    ///
+    /// 1. Degree 0-1: strict BFS (ORDER BY degree, priority)
+    /// 2. Degree 2:   BFS with hub deferral (priority first, then degree)
+    /// 3. Degree 3+:  random sampling
+    ///
+    /// Falls through tiers when the current tier is empty.
     pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
+        // Tier 1: degree 0-1, strict BFS
         let mut stmt = self.conn.prepare(
             "SELECT cs.scope_key FROM crawl_state cs \
-             JOIN users u ON u.login = cs.scope_key \
              WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
-             ORDER BY CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
-                      u.following ASC \
+               AND cs.degree <= 1 \
+             ORDER BY cs.degree ASC, \
+                      CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END \
              LIMIT ?2",
         )?;
+        let mut rows: Vec<String> = stmt
+            .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
 
-        let rows = stmt.query_map(params![crawler_name, limit as i64], |row| {
-            row.get::<_, String>(0)
-        })?;
+        // Tier 2: degree 2, BFS + hub deferral
+        let mut stmt2 = self.conn.prepare(
+            "SELECT cs.scope_key FROM crawl_state cs \
+             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
+               AND cs.degree = 2 \
+             ORDER BY CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
+                      cs.degree ASC \
+             LIMIT ?2",
+        )?;
+        rows = stmt2
+            .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        // Tier 3: degree 3+, random
+        let mut stmt3 = self.conn.prepare(
+            "SELECT cs.scope_key FROM crawl_state cs \
+             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
+               AND cs.degree >= 3 \
+             ORDER BY RANDOM() \
+             LIMIT ?2",
+        )?;
+        rows = stmt3
+            .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Set the priority of a crawl scope.
@@ -486,10 +625,16 @@ impl Db {
     }
 
     /// Insert a pending crawl scope. Uses INSERT OR IGNORE for idempotency.
-    pub fn insert_pending_scope(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError> {
+    pub fn insert_pending_scope(
+        &self,
+        crawler_name: &str,
+        scope_key: &str,
+        degree: i32,
+    ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO crawl_state (crawler_name, scope_key) VALUES (?1, ?2)",
-            params![crawler_name, scope_key],
+            "INSERT OR IGNORE INTO crawl_state (crawler_name, scope_key, degree) \
+             VALUES (?1, ?2, ?3)",
+            params![crawler_name, scope_key, degree],
         )?;
         Ok(())
     }
@@ -514,64 +659,12 @@ impl Db {
         Ok(count)
     }
 
-    /// Look up a user by primary-key id.
-    pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, login, name, avatar_url, company, location, \
-             followers, following, public_repos, created_at, updated_at \
-             FROM users WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(User {
-                id: row.get(0)?,
-                login: row.get(1)?,
-                name: row.get(2)?,
-                avatar_url: row.get(3)?,
-                company: row.get(4)?,
-                location: row.get(5)?,
-                followers: row.get(6)?,
-                following: row.get(7)?,
-                public_repos: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        })?;
-        match rows.next() {
-            Some(result) => Ok(Some(result?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Return every user in the database.
-    pub fn get_all_users(&self) -> Result<Vec<User>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, login, name, avatar_url, company, location, \
-             followers, following, public_repos, created_at, updated_at \
-             FROM users",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(User {
-                id: row.get(0)?,
-                login: row.get(1)?,
-                name: row.get(2)?,
-                avatar_url: row.get(3)?,
-                company: row.get(4)?,
-                location: row.get(5)?,
-                followers: row.get(6)?,
-                following: row.get(7)?,
-                public_repos: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// Return every edge in the database.
+    /// Return every edge in the database (active only).
     pub fn get_all_edges(&self) -> Result<Vec<Edge>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT from_user_id, to_user_id, edge_type, weight, degree, metadata, discovered_at \
-             FROM edges",
+            "SELECT from_user_id, to_user_id, edge_type, weight, degree, metadata, \
+                    is_active, first_seen_at, last_seen_at, removed_at \
+             FROM edges WHERE is_active = 1",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Edge {
@@ -581,7 +674,10 @@ impl Db {
                 weight: row.get(3)?,
                 degree: row.get(4)?,
                 metadata: row.get(5)?,
-                discovered_at: row.get(6)?,
+                is_active: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                removed_at: row.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -591,9 +687,6 @@ impl Db {
     // Common connections
     // -----------------------------------------------------------------------
 
-    /// Find logins of users that both `user1_id` and `user2_id` follow.
-    ///
-    /// When `limit` is 0, no LIMIT clause is applied (returns all results).
     pub fn get_common_following(
         &self,
         user1_id: i64,
@@ -614,6 +707,8 @@ impl Db {
                AND e2.from_user_id = ?2 \
                AND e1.edge_type = 'follows' \
                AND e2.edge_type = 'follows' \
+               AND e1.is_active = 1 \
+               AND e2.is_active = 1 \
              ORDER BY u.login \
              {limit_clause}"
         );
@@ -622,9 +717,6 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Find logins of users that follow both `user1_id` and `user2_id`.
-    ///
-    /// When `limit` is 0, no LIMIT clause is applied (returns all results).
     pub fn get_common_followers(
         &self,
         user1_id: i64,
@@ -645,6 +737,8 @@ impl Db {
                AND e2.to_user_id = ?2 \
                AND e1.edge_type = 'follows' \
                AND e2.edge_type = 'follows' \
+               AND e1.is_active = 1 \
+               AND e2.is_active = 1 \
              ORDER BY u.login \
              {limit_clause}"
         );
@@ -657,10 +751,10 @@ impl Db {
     // Graph statistics
     // -----------------------------------------------------------------------
 
-    /// Total number of `follows` edges.
+    /// Total number of active `follows` edges.
     pub fn get_edge_count(&self) -> Result<i64, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM edges WHERE edge_type = 'follows'",
+            "SELECT COUNT(*) FROM edges WHERE edge_type = 'follows' AND is_active = 1",
             [],
             |row| row.get(0),
         )?;
@@ -670,7 +764,8 @@ impl Db {
     /// Number of distinct users that have at least one outgoing follows edge.
     pub fn get_users_with_outgoing(&self) -> Result<i64, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT from_user_id) FROM edges WHERE edge_type = 'follows'",
+            "SELECT COUNT(DISTINCT from_user_id) FROM edges \
+             WHERE edge_type = 'follows' AND is_active = 1",
             [],
             |row| row.get(0),
         )?;
@@ -680,7 +775,8 @@ impl Db {
     /// Number of distinct users that have at least one incoming follows edge.
     pub fn get_users_with_incoming(&self) -> Result<i64, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT to_user_id) FROM edges WHERE edge_type = 'follows'",
+            "SELECT COUNT(DISTINCT to_user_id) FROM edges \
+             WHERE edge_type = 'follows' AND is_active = 1",
             [],
             |row| row.get(0),
         )?;
@@ -688,19 +784,16 @@ impl Db {
     }
 
     /// Weakly-connected-components analysis.
-    ///
-    /// Returns `(num_components, largest_component_ratio)` where the ratio
-    /// is `largest_size / total_users`.
     pub fn connected_components_info(&self) -> Result<(usize, f64), DbError> {
         use std::collections::{HashMap, HashSet, VecDeque};
 
         let total_users = self.get_user_count()?;
 
-        // Build undirected adjacency list.
         let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user_id, to_user_id FROM edges \
+             WHERE edge_type = 'follows' AND is_active = 1",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
         for pair in rows {
             let (a, b) = pair?;
@@ -747,7 +840,8 @@ impl Db {
     /// Number of users that `user_id` follows.
     pub fn get_following_count(&self, user_id: i64) -> Result<i64, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM edges WHERE from_user_id = ?1 AND edge_type = 'follows'",
+            "SELECT COUNT(*) FROM edges \
+             WHERE from_user_id = ?1 AND edge_type = 'follows' AND is_active = 1",
             params![user_id],
             |row| row.get(0),
         )?;
@@ -756,9 +850,10 @@ impl Db {
 
     /// All user IDs that have at least one outgoing follows edge.
     pub fn get_users_with_outgoing_ids(&self) -> Result<Vec<i64>, DbError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT from_user_id FROM edges WHERE edge_type = 'follows'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT from_user_id FROM edges \
+             WHERE edge_type = 'follows' AND is_active = 1",
+        )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }

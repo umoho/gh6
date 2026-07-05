@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 // GitHub API types (produced by github.rs, consumed by crawlers & others)
 // ---------------------------------------------------------------------------
 
+/// Full user profile returned by `GET /users/{login}`.
+/// All fields are guaranteed present (not optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GithubUser {
+pub struct GithubUserProfile {
     pub login: String,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
@@ -19,6 +21,17 @@ pub struct GithubUser {
     pub public_repos: i64,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+}
+
+/// Minimal user summary returned by `GET /users/{login}/following`.
+/// Only `login` and `avatar_url` are present; all other fields are omitted
+/// by the GitHub API. Use this type to avoid accidentally writing zero-values
+/// into the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubUserSummary {
+    pub login: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +47,9 @@ pub struct RateLimit {
 // Database types (produced by db.rs, consumed by crawlers & analyze)
 // ---------------------------------------------------------------------------
 
+/// User identity + profile, assembled from `users` JOIN `user_profiles`.
+/// Profile fields are `Option` because a user may have been discovered
+/// (exists in `users`) but not yet fetched (no row in `user_profiles`).
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct User {
@@ -43,9 +59,9 @@ pub struct User {
     pub avatar_url: Option<String>,
     pub company: Option<String>,
     pub location: Option<String>,
-    pub followers: i64,
-    pub following: i64,
-    pub public_repos: i64,
+    pub followers: Option<i64>,
+    pub following: Option<i64>,
+    pub public_repos: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -69,7 +85,10 @@ pub struct Edge {
     pub weight: f64,
     pub degree: i32,
     pub metadata: Option<String>,
-    pub discovered_at: Option<String>,
+    pub is_active: bool,
+    pub first_seen_at: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub removed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,7 +103,7 @@ pub struct DegreeDist {
 
 #[derive(Debug)]
 pub struct CrawlResult {
-    pub new_users: Vec<GithubUser>,
+    pub new_users: Vec<GithubUserSummary>,
     pub new_edges: Vec<NewEdge>,
 }
 
@@ -127,42 +146,3 @@ pub enum CrawlEvent {
         degree: i32,
     },
 }
-
-// ---------------------------------------------------------------------------
-// Public API contract – what each module MUST expose
-// ---------------------------------------------------------------------------
-//
-// === db::Db ===
-//
-// pub fn open() -> Result<Self, db::DbError>
-// pub fn upsert_user(&self, login: &str, name: Option<&str>, avatar_url: Option<&str>,
-//     company: Option<&str>, location: Option<&str>, followers: i64, following: i64,
-//     public_repos: i64, created_at: Option<&str>, updated_at: Option<&str>) -> Result<i64, DbError>
-// pub fn get_user_by_login(&self, login: &str) -> Result<Option<User>, DbError>
-// pub fn get_user_count(&self) -> Result<i64, DbError>
-// pub fn insert_edge(&self, edge: &NewEdge) -> Result<(), DbError>
-// pub fn get_edges_by_user(&self, user_id: i64) -> Result<Vec<Edge>, DbError>
-// pub fn get_shortest_path(&self, from_login: &str, to_login: &str) -> Result<Vec<User>, DbError>
-// pub fn degree_distribution(&self) -> Result<Vec<DegreeDist>, DbError>
-// pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError>
-// pub fn mark_crawl_done(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError>
-// pub fn insert_pending_scope(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError>
-// pub fn has_crawl_state(&self, crawler_name: &str, scope_key: &str) -> Result<bool, DbError>
-//
-// === github::GithubClient ===
-//
-// pub async fn new() -> Result<Self, GithubError>
-// pub async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError>
-// pub async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError>
-// pub fn rate_limit(&self) -> RateLimit
-//
-// === crawlers::Crawler trait ===
-//
-// trait Crawler {
-//     fn name(&self) -> &str;
-//     async fn crawl(&self, scope_key: &str, client: &GithubClient, db: &Db) -> Result<CrawlResult>;
-// }
-//
-// === crawlers::FollowCrawler ===
-//
-// impl Crawler for FollowCrawler { ... }

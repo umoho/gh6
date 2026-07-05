@@ -43,9 +43,9 @@ pub struct UserProfileResult {
     pub company: Option<String>,
     pub location: Option<String>,
     pub created_at: Option<String>,
-    pub followers_count: i64,
-    pub following_count: i64,
-    pub public_repos: i64,
+    pub followers_count: Option<i64>,
+    pub following_count: Option<i64>,
+    pub public_repos: Option<i64>,
     pub following: Vec<String>,
     pub mutual: Vec<String>,
     pub followers: Vec<String>,
@@ -73,8 +73,8 @@ pub struct SuggestResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Bridge {
     pub login: String,
-    pub following: i64,
-    pub followers: i64,
+    pub following: Option<i64>,
+    pub followers: Option<i64>,
     pub impact: usize,
 }
 
@@ -905,9 +905,9 @@ pub fn cmd_export(db: &Db, file: &str) -> Result<(usize, usize), Box<dyn Error>>
         avatar_url: Option<&'a str>,
         company: Option<&'a str>,
         location: Option<&'a str>,
-        followers: i64,
-        following: i64,
-        public_repos: i64,
+        followers: Option<i64>,
+        following: Option<i64>,
+        public_repos: Option<i64>,
     }
 
     #[derive(serde::Serialize)]

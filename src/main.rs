@@ -79,11 +79,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AnalyzeCommand {
-    /// Find shortest path from seed user (umoho) to target
+    /// Find shortest path from the seed user to target
     Path {
         user: String,
-        #[arg(long, default_value = "umoho")]
-        from: String,
+        /// Start from this user (defaults to seed user in config)
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         all: bool,
         /// Max paths for --all (default: 200)
@@ -573,7 +574,11 @@ fn print_path(info: &PathInfo, json: bool, with_profile: bool, with_stats: bool)
         let avg_followers: f64 = if info.path.is_empty() {
             0.0
         } else {
-            info.path.iter().map(|u| u.followers as f64).sum::<f64>() / info.path.len() as f64
+            info.path
+                .iter()
+                .map(|u| u.followers.unwrap_or(0) as f64)
+                .sum::<f64>()
+                / info.path.len() as f64
         };
         println!();
         println!("  ──");
@@ -679,9 +684,18 @@ fn print_user(result: &UserProfileResult, json: bool) {
             }
         };
         let items: Vec<(&str, String)> = vec![
-            ("followers:   ", format!("{} 人", f(result.followers_count))),
-            ("following:   ", format!("{} 人", f(result.following_count))),
-            ("公开仓库:    ", format!("{} 个", f(result.public_repos))),
+            (
+                "followers:   ",
+                format!("{} 人", f(result.followers_count.unwrap_or(0))),
+            ),
+            (
+                "following:   ",
+                format!("{} 人", f(result.following_count.unwrap_or(0))),
+            ),
+            (
+                "公开仓库:    ",
+                format!("{} 个", f(result.public_repos.unwrap_or(0))),
+            ),
         ];
         let last = items.len() - 1;
         for (i, (label, value)) in items.iter().enumerate() {
@@ -953,8 +967,8 @@ fn print_bridges(result: &BridgesResult, json: bool) {
             Row {
                 rank: format!("#{}", i + 1),
                 login: b.login.blue().to_string(),
-                following: f(b.following),
-                followers: f(b.followers),
+                following: f(b.following.unwrap_or(0)),
+                followers: f(b.followers.unwrap_or(0)),
                 impact: {
                     let s = format!("+{}", b.impact);
                     if b.impact >= 1000 {
@@ -1036,7 +1050,7 @@ fn print_fuzzy_paths(results: &FuzzyPathResult, json: bool, with_profile: bool, 
         }
         total_steps += steps;
         for u in &info.path {
-            total_followers += u.followers as f64;
+            total_followers += u.followers.unwrap_or(0) as f64;
             total_users += 1;
         }
     }
@@ -1163,7 +1177,7 @@ fn print_all_paths(paths: &AllPathsResult, json: bool, with_profile: bool, with_
         }
         total_steps += steps;
         for u in &info.path {
-            total_followers += u.followers as f64;
+            total_followers += u.followers.unwrap_or(0) as f64;
             total_users += 1;
         }
     }
@@ -1362,6 +1376,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     with_profile,
                     with_stats,
                 } => {
+                    let from = from
+                        .or_else(|| db.get_config("seed").ok().flatten())
+                        .unwrap_or_else(|| {
+                            eprintln!("No --from specified and no seed in config. Run gh6d first.");
+                            std::process::exit(1);
+                        });
                     let found = analyze::cmd_path(&db, &from, &user)?;
                     if all {
                         let paths = analyze::cmd_all_paths(&db, &from, &user, limit)?;

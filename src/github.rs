@@ -1,4 +1,4 @@
-use crate::types::{GithubUser, RateLimit};
+use crate::types::{GithubUserProfile, GithubUserSummary, RateLimit};
 use serde::Deserialize;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -26,8 +26,8 @@ pub enum GithubError {
 
 /// Abstraction over GitHub API access. Currently implemented by [`GhClient`].
 pub trait GithubApi: Send + Sync {
-    async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError>;
-    async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError>;
+    async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError>;
+    async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
     fn rate_limit(&self) -> RateLimit;
 }
 
@@ -42,11 +42,10 @@ struct GhRateLimit {
     reset: i64,
 }
 
-/// Minimal user returned by `/users/{login}/following` (summary object).
-/// All fields except `login` and `avatar_url` are `#[serde(default)]` because
-/// the following endpoint omits many fields present in the full user response.
+/// Full user profile returned by `GET /users/{login}`.
+/// All count fields are guaranteed present.
 #[derive(Debug, Deserialize)]
-struct GhUser {
+struct GhUserProfile {
     login: String,
     #[serde(default)]
     avatar_url: Option<String>,
@@ -68,9 +67,9 @@ struct GhUser {
     updated_at: Option<String>,
 }
 
-impl From<GhUser> for GithubUser {
-    fn from(u: GhUser) -> Self {
-        GithubUser {
+impl From<GhUserProfile> for GithubUserProfile {
+    fn from(u: GhUserProfile) -> Self {
+        GithubUserProfile {
             login: u.login,
             name: u.name,
             avatar_url: u.avatar_url,
@@ -81,6 +80,26 @@ impl From<GhUser> for GithubUser {
             public_repos: u.public_repos,
             created_at: u.created_at,
             updated_at: u.updated_at,
+        }
+    }
+}
+
+/// Minimal user returned by `GET /users/{login}/following`.
+/// Only `login` and `avatar_url` are present in the API response.
+/// All other fields are `Option` — if the JSON key is missing the field
+/// deserializes to `None`, never to a zero or empty value.
+#[derive(Debug, Deserialize)]
+struct GhUserSummary {
+    login: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
+impl From<GhUserSummary> for GithubUserSummary {
+    fn from(u: GhUserSummary) -> Self {
+        GithubUserSummary {
+            login: u.login,
+            avatar_url: u.avatar_url,
         }
     }
 }
@@ -157,14 +176,14 @@ impl GhClient {
 }
 
 impl GithubApi for GhClient {
-    async fn get_user(&self, login: &str) -> Result<GithubUser, GithubError> {
+    async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError> {
         let json = self.gh(&[&format!("/users/{login}")]).await?;
-        let gh_user: GhUser = serde_json::from_str(&json)?;
+        let gh_user: GhUserProfile = serde_json::from_str(&json)?;
         self.refresh_rate_limit().await;
-        Ok(GithubUser::from(gh_user))
+        Ok(GithubUserProfile::from(gh_user))
     }
 
-    async fn get_following(&self, login: &str) -> Result<Vec<GithubUser>, GithubError> {
+    async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError> {
         let output = self
             .gh(&[&format!("/users/{login}/following"), "--paginate"])
             .await?;
@@ -175,8 +194,8 @@ impl GithubApi for GhClient {
             if line.is_empty() {
                 continue;
             }
-            let page: Vec<GhUser> = serde_json::from_str(line)?;
-            users.extend(page.into_iter().map(GithubUser::from));
+            let page: Vec<GhUserSummary> = serde_json::from_str(line)?;
+            users.extend(page.into_iter().map(GithubUserSummary::from));
         }
 
         self.refresh_rate_limit().await;

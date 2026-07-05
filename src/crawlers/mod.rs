@@ -3,7 +3,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
-use crate::types::{CrawlResult, GithubUser, NewEdge};
+use crate::types::{CrawlResult, GithubUserSummary, NewEdge};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -27,11 +27,6 @@ pub trait Crawler: Send + Sync {
     fn name(&self) -> &str;
 
     /// Crawl a single scope and return newly discovered users and edges.
-    //
-    // TODO: have `crawl_loop` call this instead of `crawl_following`
-    // directly.  Currently suppressed because the crawl loop passes
-    // `degree` explicitly and does its own logging before calling
-    // the static `crawl_following` helper.
     #[allow(dead_code)]
     async fn crawl(
         &self,
@@ -55,6 +50,8 @@ impl FollowCrawler {
     /// and enqueue newly discovered users for the next BFS layer.
     ///
     /// `crawler_name` is the identifier used for `crawl_state` queries.
+    /// Only writes `login` to `users`; profile data is written separately
+    /// by the caller via `db.upsert_profile()`.
     pub async fn crawl_following(
         crawler_name: &str,
         client: &GithubClient,
@@ -62,17 +59,17 @@ impl FollowCrawler {
         login: &str,
         current_degree: i32,
     ) -> Result<CrawlResult, CrawlerError> {
-        // Phase 1: read user info from DB (lock held briefly)
-        let from_user = {
+        // Phase 1: read user id from DB (lock held briefly)
+        let from_user_id = {
             let db_guard = db.lock().await;
-            db_guard
+            let user = db_guard
                 .get_user_by_login(login)?
-                .ok_or_else(|| CrawlerError::UserNotFound(login.to_string()))?
+                .ok_or_else(|| CrawlerError::UserNotFound(login.to_string()))?;
+            user.id
         };
-        let from_user_id = from_user.id;
 
         // Phase 2: HTTP request (lock NOT held — this is the await point)
-        let following: Vec<GithubUser> = client.get_following(login).await?;
+        let following: Vec<GithubUserSummary> = client.get_following(login).await?;
 
         // Phase 3: persist results to DB (lock held for bulk writes)
         let next_degree = current_degree + 1;
@@ -82,8 +79,9 @@ impl FollowCrawler {
         {
             let db_guard = db.lock().await;
 
-            for gh_user in &following {
-                let to_user_id = db_guard.upsert_user(gh_user)?;
+            for summary in &following {
+                // Only write login to users table — never touch profile fields.
+                let to_user_id = db_guard.insert_user(&summary.login)?;
 
                 let edge = NewEdge {
                     from_user_id,
@@ -96,12 +94,12 @@ impl FollowCrawler {
                 db_guard.insert_edge(&edge)?;
                 new_edges.push(edge);
 
-                let already_crawled = db_guard.has_crawl_state(crawler_name, &gh_user.login)?;
+                let already_crawled = db_guard.has_crawl_state(crawler_name, &summary.login)?;
                 if !already_crawled {
-                    db_guard.insert_pending_scope(crawler_name, &gh_user.login)?;
+                    db_guard.insert_pending_scope(crawler_name, &summary.login, next_degree)?;
                 }
 
-                new_users.push(gh_user.clone());
+                new_users.push(summary.clone());
             }
 
             db_guard.mark_crawl_done(crawler_name, login)?;

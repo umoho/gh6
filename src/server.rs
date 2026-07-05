@@ -1,6 +1,7 @@
 use log::{error, info, warn};
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,7 +53,9 @@ impl ServerState {
 
 /// Start the daemon: open db, seed, spawn crawl loop (starts paused),
 /// listen on Unix socket, handle SIGTERM/SIGINT for graceful shutdown.
-pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `seed_user` — if provided, use as seed. Otherwise auto-detect from `gh api /user`.
+pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let crawler = FollowCrawler::new();
     let crawler_name = crawler.name().to_string();
 
@@ -92,25 +95,50 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to bind socket {}: {e}", socket_path.display()))?;
     info!("Listening on {}", socket_path.display());
 
-    // 4. Seed the database if empty (first run)
+    // 4. Determine seed user and seed the database if empty (first run)
     {
         let db_guard = db.lock().await;
         let user_count = db_guard
             .get_user_count()
             .map_err(|e| format!("db error: {e}"))?;
+
         if user_count == 0 {
-            info!("First run: fetching seed user 'umoho'…");
-            let umoho = client
-                .get_user("umoho")
+            let seed = match seed_user {
+                Some(ref s) => s.clone(),
+                None => {
+                    info!("No --seed provided, auto-detecting from gh api /user…");
+                    detect_gh_user().map_err(|e| {
+                        format!(
+                            "Could not auto-detect seed user: {e}. \
+                                 Run with `gh6d --seed <your-login>` to specify manually."
+                        )
+                    })?
+                }
+            };
+            info!("First run: seeding with user '{seed}'…");
+
+            // Store seed in config so analyze commands can read it.
+            db_guard
+                .set_config("seed", &seed)
+                .map_err(|e| format!("db error saving seed config: {e}"))?;
+
+            // Fetch full profile for the seed user.
+            let profile = client
+                .get_user(&seed)
                 .await
-                .map_err(|e| format!("failed to fetch seed user 'umoho': {e}"))?;
+                .map_err(|e| format!("failed to fetch seed user '{seed}': {e}"))?;
+
+            let user_id = db_guard
+                .insert_user(&profile.login)
+                .map_err(|e| format!("db error inserting seed user: {e}"))?;
             db_guard
-                .upsert_user(&umoho)
-                .map_err(|e| format!("db error seeding user: {e}"))?;
+                .upsert_profile(user_id, &profile)
+                .map_err(|e| format!("db error upserting seed profile: {e}"))?;
             db_guard
-                .insert_pending_scope(&crawler_name, "umoho")
+                .insert_pending_scope(&crawler_name, &seed, 0)
                 .map_err(|e| format!("db error seeding scope: {e}"))?;
-            info!("Seed user 'umoho' added.");
+
+            info!("Seed user '{seed}' added.");
         }
     }
 
@@ -193,6 +221,24 @@ pub async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ── Seed user auto-detection ──────────────────────────────────────────────
+
+/// Run `gh api /user --jq '.login'` to get the authenticated user's login.
+fn detect_gh_user() -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["api", "/user", "--jq", ".login"])
+        .output()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if login.is_empty() {
+        return Err("gh returned empty login".to_string());
+    }
+    Ok(login)
+}
+
 // ── Crawl loop ────────────────────────────────────────────────────────────
 
 async fn crawl_loop(
@@ -237,23 +283,42 @@ async fn crawl_loop(
 
         *state.currently_crawling.write().await = Some(scope.clone());
 
-        // Lazily fetch user profile to learn the real following count.
-        let following_count = {
+        // Lazily fetch user profile if missing or stale.
+        let user_id = {
             let db_guard = db.lock().await;
             db_guard
                 .get_user_by_login(&scope)
                 .ok()
                 .flatten()
-                .map(|u| u.following)
-                .unwrap_or(0)
+                .map(|u| u.id)
         };
 
-        if following_count == 0 {
+        let following_count = if let Some(uid) = user_id {
+            let db_guard = db.lock().await;
+            // Check if profile exists and get following count.
+            if db_guard.has_profile(uid).unwrap_or(false) {
+                db_guard
+                    .get_user_by_login(&scope)
+                    .ok()
+                    .flatten()
+                    .and_then(|u| u.following)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if following_count.is_none() {
+            // Profile missing — fetch it.
             match client.get_user(&scope).await {
-                Ok(full_user) => {
-                    let count = full_user.following;
+                Ok(profile) => {
+                    let count = profile.following;
                     let db_guard = db.lock().await;
-                    let _ = db_guard.upsert_user(&full_user);
+                    let uid = db_guard.insert_user(&profile.login).unwrap_or(0);
+                    if uid > 0 {
+                        let _ = db_guard.upsert_profile(uid, &profile);
+                    }
                     drop(db_guard);
 
                     if count >= HUB_FOLLOWING_THRESHOLD {

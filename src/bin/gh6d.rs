@@ -12,17 +12,21 @@ use log::info;
 
 #[derive(Parser)]
 #[command(name = "gh6d", version, about = "GitHub Social Graph Explorer daemon")]
-struct Cli {}
+struct Cli {
+    /// Seed user to start crawling from (defaults to `gh api /user`).
+    #[arg(long)]
+    seed: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
     info!("Starting gh6d daemon…");
-    gh6::server::run_daemon().await?;
+    gh6::server::run_daemon(cli.seed).await?;
     info!("Daemon stopped.");
     Ok(())
 }
