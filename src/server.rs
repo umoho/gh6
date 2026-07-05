@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::crawlers::{Crawler, FollowCrawler};
@@ -170,15 +171,22 @@ pub async fn run_daemon(
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
     }
 
-    // 6. Register CTRL-C handler for graceful shutdown
+    // 6. Register signal handler for graceful shutdown
     {
         let state = Arc::clone(&state);
-        ctrlc::set_handler(move || {
+        tokio::spawn(async move {
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
             info!("Received shutdown signal, stopping…");
             state.abort.store(true, Ordering::SeqCst);
             state.shutdown.store(true, Ordering::SeqCst);
-        })
-        .expect("failed to register CTRL-C handler");
+        });
     }
 
     // 7. Spawn crawl workers (start paused, wait for 'gh6 run')
