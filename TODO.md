@@ -1,22 +1,25 @@
 # TODO
 
-## 本次重构：数据库拆分 (v3)
-
-- [ ] 重写 migration 001_init.sql（新 schema：users, user_profiles, edges[含生命周期], edge_history, crawl_state[含 degree], config）
-- [ ] 删除 migration 002_priority.sql（已并入 001）
-- [ ] 更新 `types.rs`：User 拆分 / GithubUser 拆分
-- [ ] 更新 `github.rs`：GhUser 字段改为 Option<i64>，区分 null vs 0
-- [ ] 更新 `db.rs`：
-  - [ ] upsert_user → insert_user(login) + upsert_profile
-  - [ ] 所有读 users 的查询 JOIN user_profiles
-  - [ ] pending_scopes 实现三层分流（度 0-1 BFS / 度 2 BFS+中枢延后 / 度 3+ 随机）
-  - [ ] crawl_state 加 degree 列，insert_pending_scope 写入 degree
-- [ ] 更新 `crawlers/mod.rs`：crawl_following 写 users（只插 login）不碰 profile
-- [ ] 更新 `server.rs`：crawl_loop 惰性 fetch profile 逻辑适配新表
-- [ ] 更新 `analyze.rs`：所有读 User 的地方适配新结构
-- [ ] 更新 `main.rs` 的导出等逻辑
-- [ ] 种子用户可配置（gh6d --seed，自动探测 gh api /user，写入 config 表）
-- [ ] analyze path --from 默认从 config 表读种子
+- [x] 重写 migration 001_init.sql（新 schema）
+- [x] 删除 migration 002_priority.sql
+- [x] 拆分 types.rs：GithubUser → GithubUserSummary + GithubUserProfile
+- [x] 拆分 types.rs：User 适配新表结构
+- [x] 更新 github.rs：get_following 返回 Vec<GithubUserSummary>
+- [x] 更新 github.rs：get_user 返回 GithubUserProfile
+- [x] 新增 db.rs：insert_user / upsert_profile
+- [x] 新增 db.rs：insert_edge + edge_history 记录
+- [x] 重写 db.rs：pending_scopes 三层分流
+- [x] 更新 db.rs：所有读 User 的查询 JOIN user_profiles
+- [x] 新增 db.rs：get_config / set_config
+- [x] 更新 db.rs：insert_pending_scope 写入 degree
+- [x] 更新 crawlers/mod.rs：crawl_following 只写 login 到 users
+- [x] 更新 server.rs：seed 逻辑改用 --seed + 自动探测 + config
+- [x] 新增 gh6d --seed 参数
+- [x] 更新 server.rs：crawl_loop 惰性 fetch profile
+- [x] 更新 analyze.rs 适配 Option<i64>
+- [x] 更新 main.rs：analyze path --from 从 config 读种子
+- [x] 修复 github.rs：手动分页替代 --paginate（中枢用户不卡死）
+- [ ] 优化：分页循环内逐页写 DB，避免被杀时丢失已拉取的数据
 
 ## 基础设施
 

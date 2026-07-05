@@ -184,21 +184,27 @@ impl GithubApi for GhClient {
     }
 
     async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError> {
-        let output = self
-            .gh(&[&format!("/users/{login}/following"), "--paginate"])
-            .await?;
-
         let mut users = Vec::new();
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        let mut page = 1u32;
+        // Use manual pagination instead of `--paginate` so that
+        // large following lists don't block the crawl loop indefinitely.
+        // Each page is fetched individually, allowing rate-limit refreshes
+        // and external visibility of progress between pages.
+        loop {
+            let json = self
+                .gh(&[&format!(
+                    "/users/{login}/following?page={page}&per_page=100"
+                )])
+                .await?;
+            let batch: Vec<GhUserSummary> = serde_json::from_str(&json)?;
+            if batch.is_empty() {
+                break;
             }
-            let page: Vec<GhUserSummary> = serde_json::from_str(line)?;
-            users.extend(page.into_iter().map(GithubUserSummary::from));
+            users.extend(batch.into_iter().map(GithubUserSummary::from));
+            self.refresh_rate_limit().await;
+            page += 1;
         }
 
-        self.refresh_rate_limit().await;
         Ok(users)
     }
 
