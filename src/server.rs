@@ -284,10 +284,11 @@ async fn crawl_loop(
             match db_guard.claim_scope(crawler_name) {
                 Ok(Some(s)) => s,
                 Ok(None) => {
-                    // Queue empty — auto-pause and wait
-                    state.paused.store(true, Ordering::SeqCst);
+                    // Queue empty — sleep briefly and retry.
+                    // (Do NOT auto-pause here — other workers may be
+                    //  producing new scopes concurrently.)
                     drop(db_guard);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
                 Err(e) => {
