@@ -30,11 +30,12 @@ struct ServerState {
     started_at: Instant,
     shutdown: AtomicBool,
     paused: AtomicBool,
+    abort: Arc<AtomicBool>,
     event_tx: broadcast::Sender<CrawlEvent>,
 }
 
 impl ServerState {
-    fn new(event_tx: broadcast::Sender<CrawlEvent>) -> Self {
+    fn new(event_tx: broadcast::Sender<CrawlEvent>, abort: Arc<AtomicBool>) -> Self {
         Self {
             currently_crawling: RwLock::new(None),
             current_degree: AtomicI32::new(0),
@@ -44,6 +45,7 @@ impl ServerState {
             started_at: Instant::now(),
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(true),
+            abort,
             event_tx,
         }
     }
@@ -63,8 +65,9 @@ pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::er
     let db = Db::open().map_err(|e| format!("failed to open database: {e}"))?;
     let db = Arc::new(Mutex::new(db));
 
-    // 2. Create GitHub client
-    let client = GithubClient::new()
+    // 2. Create GitHub client (with shared abort flag for graceful shutdown)
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let client = GithubClient::new(Arc::clone(&abort_flag))
         .await
         .map_err(|e| format!("failed to create GitHub client: {e}"))?;
 
@@ -144,7 +147,7 @@ pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::er
 
     // 5. Create shared state
     let (event_tx, _) = broadcast::channel(256);
-    let state = Arc::new(ServerState::new(event_tx));
+    let state = Arc::new(ServerState::new(event_tx, Arc::clone(&abort_flag)));
 
     // Sync initial rate-limit from client
     {
@@ -167,6 +170,7 @@ pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::er
                 _ = sigint.recv() => {}
             }
             info!("Received shutdown signal, stopping…");
+            state.abort.store(true, Ordering::SeqCst);
             state.shutdown.store(true, Ordering::SeqCst);
         });
     }
@@ -489,6 +493,7 @@ async fn handle_client(
             }
         }
         "start" => {
+            state.abort.store(false, Ordering::SeqCst);
             let was_paused = state.paused.swap(false, Ordering::SeqCst);
             let msg = if was_paused {
                 "started"
@@ -506,6 +511,8 @@ async fn handle_client(
         "pause" => {
             let was_running = !state.paused.swap(true, Ordering::SeqCst);
             let msg = if was_running {
+                // Also signal the pagination loop to stop.
+                state.abort.store(true, Ordering::SeqCst);
                 "paused"
             } else {
                 "already paused"

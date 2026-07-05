@@ -2,6 +2,7 @@ use crate::types::{GithubUserProfile, GithubUserSummary, RateLimit};
 use log::{debug, trace};
 use serde::Deserialize;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -113,10 +114,11 @@ pub type GithubClient = GhClient;
 
 pub struct GhClient {
     rate_limit: Arc<Mutex<RateLimit>>,
+    abort: Arc<AtomicBool>,
 }
 
 impl GhClient {
-    pub async fn new() -> Result<Self, GithubError> {
+    pub async fn new(abort: Arc<AtomicBool>) -> Result<Self, GithubError> {
         // Verify gh is available and authenticated
         let output = Command::new("gh")
             .args(["auth", "status"])
@@ -132,6 +134,7 @@ impl GhClient {
                 remaining: 5000,
                 reset_at: 0,
             })),
+            abort,
         };
         // Best-effort: fetch real rate limit on startup
         let _ = client.refresh_rate_limit().await;
@@ -196,6 +199,12 @@ impl GithubApi for GhClient {
         // and external visibility of progress between pages.
         debug!("get_following({login}): starting manual pagination");
         loop {
+            // Check abort flag on each iteration so Ctrl-C and pause
+            // interrupt long pagination runs.
+            if self.abort.load(Ordering::SeqCst) {
+                debug!("get_following({login}): aborted at page {page}");
+                break;
+            }
             trace!("get_following({login}): fetching page {page}");
             let json = self
                 .gh(&[&format!(
