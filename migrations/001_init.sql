@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     status         TEXT DEFAULT 'pending',
     priority       TEXT DEFAULT 'normal',
     degree         INTEGER,
+    error_count    INTEGER DEFAULT 0,
     last_error     TEXT,
     crawled_at     TEXT,
     PRIMARY KEY (crawler_name, scope_key)

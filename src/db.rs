@@ -550,64 +550,63 @@ impl Db {
     /// This prevents multiple workers from grabbing the same scope.
     /// Returns `None` if no pending scopes exist.
     pub fn claim_scope(&self, crawler_name: &str) -> Result<Option<String>, DbError> {
-        // Tier 1: degree 0-1, strict BFS
-        let sql1 = "UPDATE crawl_state SET status = 'in_progress' \
-                    WHERE rowid = ( \
-                      SELECT rowid FROM crawl_state \
-                      WHERE crawler_name = ?1 AND status = 'pending' \
-                        AND degree <= 1 \
-                      ORDER BY degree ASC, \
-                        CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END \
-                      LIMIT 1 \
-                    ) RETURNING scope_key";
-        if let Ok(scope) = self
-            .conn
-            .query_row(sql1, params![crawler_name], |row| row.get::<_, String>(0))
-        {
-            return Ok(Some(scope));
+        // Try pending first, then retry (fewer errors first).
+        for status in ["pending", "retry"] {
+            for (where_c, order_c) in [
+                (
+                    "degree <= 1",
+                    "ORDER BY degree ASC, CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, error_count ASC",
+                ),
+                (
+                    "degree = 2",
+                    "ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, error_count ASC, degree ASC",
+                ),
+                ("degree >= 3", "ORDER BY error_count ASC, RANDOM()"),
+            ] {
+                let sql = format!(
+                    "UPDATE crawl_state SET status = 'in_progress' \
+                     WHERE rowid = (SELECT rowid FROM crawl_state \
+                       WHERE crawler_name = ?1 AND status = '{status}' \
+                         AND {where_c} {order_c} LIMIT 1) RETURNING scope_key"
+                );
+                match self
+                    .conn
+                    .query_row(&sql, params![crawler_name], |row| row.get::<_, String>(0))
+                {
+                    Ok(scope) => return Ok(Some(scope)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
-
-        // Tier 2: degree 2, BFS + hub deferral
-        let sql2 = "UPDATE crawl_state SET status = 'in_progress' \
-                    WHERE rowid = ( \
-                      SELECT rowid FROM crawl_state \
-                      WHERE crawler_name = ?1 AND status = 'pending' \
-                        AND degree = 2 \
-                      ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
-                        degree ASC \
-                      LIMIT 1 \
-                    ) RETURNING scope_key";
-        if let Ok(scope) = self
-            .conn
-            .query_row(sql2, params![crawler_name], |row| row.get::<_, String>(0))
-        {
-            return Ok(Some(scope));
-        }
-
-        // Tier 3: degree 3+, random
-        let sql3 = "UPDATE crawl_state SET status = 'in_progress' \
-                    WHERE rowid = ( \
-                      SELECT rowid FROM crawl_state \
-                      WHERE crawler_name = ?1 AND status = 'pending' \
-                        AND degree >= 3 \
-                      ORDER BY RANDOM() \
-                      LIMIT 1 \
-                    ) RETURNING scope_key";
-        if let Ok(scope) = self
-            .conn
-            .query_row(sql3, params![crawler_name], |row| row.get::<_, String>(0))
-        {
-            return Ok(Some(scope));
-        }
-
         Ok(None)
     }
 
-    /// Get pending scopes for status display (includes 'in_progress').
+    /// Reset a failed scope to 'retry' with incremented error count.
+    pub fn reset_to_retry(&self, scope_key: &str, error_msg: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE crawl_state SET status = 'retry', error_count = error_count + 1, \
+             last_error = ?2 WHERE status = 'in_progress' AND scope_key = ?1",
+            params![scope_key, error_msg],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a scope as permanently errored.
+    pub fn mark_error(&self, scope_key: &str, error_msg: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE crawl_state SET status = 'error', last_error = ?2 \
+             WHERE scope_key = ?1",
+            params![scope_key, error_msg],
+        )?;
+        Ok(())
+    }
+
+    /// Get pending/retry/in_progress scopes for status display.
     pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT scope_key FROM crawl_state \
-             WHERE crawler_name = ?1 AND status IN ('pending', 'in_progress') \
+             WHERE crawler_name = ?1 AND status IN ('pending', 'retry', 'in_progress') \
              LIMIT ?2",
         )?;
         let rows = stmt

@@ -72,7 +72,7 @@ pub async fn run_daemon(
     {
         let db_guard = db.lock().await;
         if let Err(e) = db_guard.conn.execute(
-            "UPDATE crawl_state SET status = 'pending' WHERE status = 'in_progress'",
+            "UPDATE crawl_state SET status = 'pending' WHERE status IN ('in_progress', 'retry')",
             [],
         ) {
             warn!("Failed to reset stale in_progress scopes: {e}");
@@ -438,14 +438,11 @@ async fn crawl_loop(
             }
             Err(e) => {
                 error!("Error crawling {scope}: {e}");
-                // Reset to pending so another worker can retry.
-                // No partial writes happened — get_following either
-                // succeeds fully or fails before any DB writes.
+                // Reset to retry — another worker will pick it up later.
+                // Network errors are transient; permanent errors (404) would
+                // be caught separately via mark_error().
                 let db_guard = db.lock().await;
-                if let Err(e2) = db_guard.conn.execute(
-                    "UPDATE crawl_state SET status = 'pending' WHERE status = 'in_progress' AND scope_key = ?1",
-                    rusqlite::params![scope],
-                ) {
+                if let Err(e2) = db_guard.reset_to_retry(&scope, &e.to_string()) {
                     error!("Also failed to reset {scope}: {e2}");
                 }
             }
