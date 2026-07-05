@@ -16,6 +16,10 @@ struct Cli {
     /// Seed user to start crawling from (defaults to `gh api /user`).
     #[arg(long)]
     seed: Option<String>,
+
+    /// Number of parallel crawl workers (default: 3).
+    #[arg(long, default_value = "3")]
+    workers: usize,
 }
 
 #[tokio::main]
@@ -26,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .format_timestamp_secs()
         .init();
     info!("Starting gh6d daemon…");
-    gh6::server::run_daemon(cli.seed).await?;
+    gh6::server::run_daemon(cli.seed, cli.workers).await?;
     info!("Daemon stopped.");
     Ok(())
 }

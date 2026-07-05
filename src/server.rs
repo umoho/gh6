@@ -57,7 +57,10 @@ impl ServerState {
 /// listen on Unix socket, handle SIGTERM/SIGINT for graceful shutdown.
 ///
 /// `seed_user` — if provided, use as seed. Otherwise auto-detect from `gh api /user`.
-pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_daemon(
+    seed_user: Option<String>,
+    workers: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let crawler = FollowCrawler::new();
     let crawler_name = crawler.name().to_string();
 
@@ -175,20 +178,26 @@ pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::er
         });
     }
 
-    // 7. Channel to signal crawl-loop completion
-    let (crawl_done_tx, mut crawl_done_rx) = tokio::sync::oneshot::channel();
-
-    // 8. Spawn the crawl loop (starts in paused state, waits for 'gh6 run')
+    // 7. Spawn crawl workers (start paused, wait for 'gh6 run')
     let crawl_state = state.clone();
     let crawl_db = db.clone();
     let cn = crawler_name.clone();
-    tokio::spawn(async move {
-        crawl_loop(crawl_state, crawl_db, client, &cn).await;
-        let _ = crawl_done_tx.send(());
-    });
+    for _ in 0..workers {
+        let s = crawl_state.clone();
+        let d = crawl_db.clone();
+        let c = client.clone();
+        let n = cn.clone();
+        tokio::spawn(async move {
+            crawl_loop(s, d, c, &n).await;
+        });
+    }
+    info!("Spawned {workers} crawl worker(s)");
 
-    // 9. Accept client connections
+    // 8. Accept client connections (until shutdown)
     loop {
+        if state.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -206,10 +215,6 @@ pub async fn run_daemon(seed_user: Option<String>) -> Result<(), Box<dyn std::er
                         error!("Accept error: {e}");
                     }
                 }
-            }
-            _ = &mut crawl_done_rx => {
-                info!("Crawl loop exited, shutting down server…");
-                break;
             }
         }
     }

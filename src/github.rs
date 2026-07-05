@@ -117,6 +117,16 @@ pub struct GhClient {
     abort: Arc<AtomicBool>,
 }
 
+// Manual Clone — both fields are Arc so cloning is cheap.
+impl Clone for GhClient {
+    fn clone(&self) -> Self {
+        Self {
+            rate_limit: Arc::clone(&self.rate_limit),
+            abort: Arc::clone(&self.abort),
+        }
+    }
+}
+
 impl GhClient {
     pub async fn new(abort: Arc<AtomicBool>) -> Result<Self, GithubError> {
         // Verify gh is available and authenticated
