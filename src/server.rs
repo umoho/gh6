@@ -352,6 +352,18 @@ async fn crawl_loop(
                 "profile already cached for {scope}, following_count={}",
                 following_count.unwrap_or(0)
             );
+            // Defer hub even when profile is already cached.
+            if following_count.unwrap_or(0) >= HUB_FOLLOWING_THRESHOLD {
+                info!(
+                    "Deferring hub {scope} ({} following)",
+                    following_count.unwrap()
+                );
+                let db_guard = db.lock().await;
+                let _ = db_guard.set_priority(crawler_name, &scope, "low");
+                drop(db_guard);
+                *state.currently_crawling.write().await = None;
+                continue;
+            }
         }
 
         let degree = {
