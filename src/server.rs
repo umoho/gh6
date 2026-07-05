@@ -68,6 +68,17 @@ pub async fn run_daemon(
     let db = Db::open().map_err(|e| format!("failed to open database: {e}"))?;
     let db = Arc::new(Mutex::new(db));
 
+    // Reset any stale in_progress scopes from a previous unclean shutdown.
+    {
+        let db_guard = db.lock().await;
+        if let Err(e) = db_guard.conn.execute(
+            "UPDATE crawl_state SET status = 'pending' WHERE status = 'in_progress'",
+            [],
+        ) {
+            warn!("Failed to reset stale in_progress scopes: {e}");
+        }
+    }
+
     // 2. Create GitHub client (with shared abort flag for graceful shutdown)
     let abort_flag = Arc::new(AtomicBool::new(false));
     let client = GithubClient::new(Arc::clone(&abort_flag))
@@ -219,13 +230,8 @@ pub async fn run_daemon(
         }
     }
 
-    // 10. Cleanup
+    // 10. Cleanup — skip DB read to avoid deadlock with in-flight workers
     let _ = std::fs::remove_file(&socket_path);
-    let db_guard = db.lock().await;
-    match db_guard.get_user_count() {
-        Ok(total) => info!("Total users in database: {total}"),
-        Err(e) => info!("Could not read user count: {e}"),
-    }
     info!("Server stopped.");
     Ok(())
 }
