@@ -19,6 +19,11 @@
 - [x] 更新 analyze.rs 适配 Option<i64>
 - [x] 更新 main.rs：analyze path --from 从 config 读种子
 - [x] 修复 github.rs：手动分页替代 --paginate（中枢用户不卡死）
+- [x] 修复 crawl：中枢延后对已缓存 profile 也生效
+- [x] 修复 crawl：分页期间响应 shutdown/pause（abort flag）
+- [x] 修复 ui：UserQueued 事件只发给真正新入队的用户
+- [x] 并行 worker（gh6d --workers，默认 3，atomic claim_scope）
+- [x] debug/trace 日志（RUST_LOG=gh6=debug）
 - [ ] 优化：分页循环内逐页写 DB，避免被杀时丢失已拉取的数据
 
 ## 基础设施
