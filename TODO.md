@@ -2,7 +2,7 @@
 
 ## 本次重构：数据库拆分 (v3)
 
-- [ ] 重写 migration 001_init.sql（新 schema：users, user_profiles, edges[含生命周期], edge_history, crawl_state[含 degree]）
+- [ ] 重写 migration 001_init.sql（新 schema：users, user_profiles, edges[含生命周期], edge_history, crawl_state[含 degree], config）
 - [ ] 删除 migration 002_priority.sql（已并入 001）
 - [ ] 更新 `types.rs`：User 拆分 / GithubUser 拆分
 - [ ] 更新 `github.rs`：GhUser 字段改为 Option<i64>，区分 null vs 0
@@ -15,6 +15,8 @@
 - [ ] 更新 `server.rs`：crawl_loop 惰性 fetch profile 逻辑适配新表
 - [ ] 更新 `analyze.rs`：所有读 User 的地方适配新结构
 - [ ] 更新 `main.rs` 的导出等逻辑
+- [ ] 种子用户可配置（gh6d --seed，自动探测 gh api /user，写入 config 表）
+- [ ] analyze path --from 默认从 config 表读种子
 
 ## 基础设施
 
@@ -49,7 +51,7 @@
   - [x] 速率限制处理（检查 X-RateLimit-Remaining，sleep 到重置）
   - [x] 检查停止标志（shutdown）和暂停标志（paused）
   - [x] broadcast 推送事件
-- [x] 种子用户初始化（umoho，degree=0）
+- [x] 种子用户初始化（可配置，degree=0）
 - [x] 队列空时自动 IDLE
 - [x] 守护启动时默认 IDLE（paused=true，等待 gh6 run）
 

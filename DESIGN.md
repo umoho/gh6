@@ -260,6 +260,13 @@ CREATE TABLE crawl_state (
     PRIMARY KEY (crawler_name, scope_key)
 );
 
+-- 全局配置（首次启动写入，之后只读）
+CREATE TABLE config (
+    key            TEXT PRIMARY KEY,
+    value          TEXT NOT NULL
+);
+-- 预置 key: 'seed' — 种子用户 login
+
 -- (未来) 仓库
 -- CREATE TABLE repos (
 --     id             INTEGER PRIMARY KEY,
@@ -352,7 +359,7 @@ else:
 
 - 方向：单向，只爬 `following`（用户关注的人）
 - 边类型：`"follows"`，weight 1.0
-- 种子用户：`umoho`
+- 种子用户：可配置（`gh6d --seed`，默认自动探测 `gh api /user`），存入 `config` 表
 - 速率限制：每次 API 调用后检查 `X-RateLimit-Remaining`，接近 0 时 sleep 到重置窗口
 
 ### 爬取流程
