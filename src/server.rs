@@ -438,9 +438,15 @@ async fn crawl_loop(
             }
             Err(e) => {
                 error!("Error crawling {scope}: {e}");
+                // Reset to pending so another worker can retry.
+                // No partial writes happened — get_following either
+                // succeeds fully or fails before any DB writes.
                 let db_guard = db.lock().await;
-                if let Err(e2) = db_guard.mark_crawl_done(crawler_name, &scope) {
-                    error!("Also failed to mark {scope} as done: {e2}");
+                if let Err(e2) = db_guard.conn.execute(
+                    "UPDATE crawl_state SET status = 'pending' WHERE status = 'in_progress' AND scope_key = ?1",
+                    rusqlite::params![scope],
+                ) {
+                    error!("Also failed to reset {scope}: {e2}");
                 }
             }
         }
