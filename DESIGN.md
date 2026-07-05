@@ -320,15 +320,42 @@ CREATE TABLE crawl_state (
 
 ## 爬虫核心
 
+### 爬取策略：分层推进
+
+纯 BFS 的问题：浅层没爬完，深层永久冻结；中枢用户（`following > 5000`）拖慢队列。
+因此采用三层混合策略：
+
+| 度 | 策略 | 中枢处理 | 目的 |
+|----|------|---------|------|
+| 0–1 | 严格 BFS，全部照爬 | 不跳过 | 自己和直接朋友，圈子小，全量不贵 |
+| 2 | BFS，中枢延后 | `following > 5000` → `priority = low`，日常只取 `normal`，队列空时才取 `low` | 朋友的朋友，大 V 往后排 |
+| 3+ | 随机采样 | 不管中枢，随机抽就完事 | 深层保证推进，不会永远卡死 |
+
+`crawl_state` 新增 `degree` 列，`insert_pending_scope` 时直接写入，省去反查 edges 的开销：
+
+```sql
+ALTER TABLE crawl_state ADD COLUMN degree INTEGER;
+```
+
+取待办时按三层分流：
+
+```
+if 度 0-1 有 pending:
+    → ORDER BY degree ASC, priority ASC      # 严格 BFS
+elif 度 2 有 pending:
+    → ORDER BY priority ASC, degree ASC     # BFS + 中枢延后
+else:
+    → 度 3+ 随机抽                           # ORDER BY RANDOM() 或伪随机
+```
+
 ### 第一阶段：FollowCrawler
 
 - 方向：单向，只爬 `following`（用户关注的人）
 - 边类型：`"follows"`，weight 1.0
 - 种子用户：`umoho`
-- 策略：BFS 逐层全量扩展
 - 速率限制：每次 API 调用后检查 `X-RateLimit-Remaining`，接近 0 时 sleep 到重置窗口
 
-### BFS 流程
+### 爬取流程
 
 ```
 1. 查询 crawl_state 中 crawler_name='follow_crawler' 且 status='pending' 的 scope（优先 low degree）
@@ -337,7 +364,7 @@ CREATE TABLE crawl_state (
 4. 调 GET /users/{login}/following 获取该用户的关注列表（摘要）
 5. 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
 6. 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1, is_active=1）
-7. 对于每个新发现用户，在 crawl_state 中创建 pending 记录（degree+1）
+7. 对于每个新发现用户，在 crawl_state 中创建 pending 记录（degree = 当前度+1）
 8. 将该 scope_key 标记为 done
 9. 检查 AtomicBool 是否应停止
 10. 检查速率限制，sleep 或继续下一个

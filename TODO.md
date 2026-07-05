@@ -2,20 +2,19 @@
 
 ## 本次重构：数据库拆分 (v3)
 
-- [ ] 写 migration 003_split_profiles.sql（拆 users → users + user_profiles）
-- [ ] 新增 migration 004_edge_lifecycle.sql（edges 加 is_active / first_seen_at / last_seen_at / removed_at）
-- [ ] 新增 migration 005_edge_history.sql（edge_history 表）
+- [ ] 重写 migration 001_init.sql（新 schema：users, user_profiles, edges[含生命周期], edge_history, crawl_state[含 degree]）
+- [ ] 删除 migration 002_priority.sql（已并入 001）
 - [ ] 更新 `types.rs`：User 拆分 / GithubUser 拆分
 - [ ] 更新 `github.rs`：GhUser 字段改为 Option<i64>，区分 null vs 0
 - [ ] 更新 `db.rs`：
   - [ ] upsert_user → insert_user(login) + upsert_profile
   - [ ] 所有读 users 的查询 JOIN user_profiles
-  - [ ] pending_scopes 排序：user_profiles 缺失的排最前
+  - [ ] pending_scopes 实现三层分流（度 0-1 BFS / 度 2 BFS+中枢延后 / 度 3+ 随机）
+  - [ ] crawl_state 加 degree 列，insert_pending_scope 写入 degree
 - [ ] 更新 `crawlers/mod.rs`：crawl_following 写 users（只插 login）不碰 profile
 - [ ] 更新 `server.rs`：crawl_loop 惰性 fetch profile 逻辑适配新表
 - [ ] 更新 `analyze.rs`：所有读 User 的地方适配新结构
 - [ ] 更新 `main.rs` 的导出等逻辑
-- [ ] migration 脚本：迁移现有数据（users → users + user_profiles）
 
 ## 基础设施
 
