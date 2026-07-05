@@ -352,18 +352,6 @@ async fn crawl_loop(
                 "profile already cached for {scope}, following_count={}",
                 following_count.unwrap_or(0)
             );
-            // Defer hub even when profile is already cached.
-            if following_count.unwrap_or(0) >= HUB_FOLLOWING_THRESHOLD {
-                info!(
-                    "Deferring hub {scope} ({} following)",
-                    following_count.unwrap()
-                );
-                let db_guard = db.lock().await;
-                let _ = db_guard.set_priority(crawler_name, &scope, "low");
-                drop(db_guard);
-                *state.currently_crawling.write().await = None;
-                continue;
-            }
         }
 
         let degree = {
@@ -381,6 +369,21 @@ async fn crawl_loop(
                 _ => 0,
             }
         };
+
+        // Re-check hub threshold for cached profiles.
+        // Only defer hubs at degree 2+ (degree 0-1 must be fully crawled).
+        if degree >= 2 && following_count.unwrap_or(0) >= HUB_FOLLOWING_THRESHOLD {
+            info!(
+                "Deferring hub {scope} ({} following)",
+                following_count.unwrap()
+            );
+            let db_guard = db.lock().await;
+            let _ = db_guard.set_priority(crawler_name, &scope, "low");
+            drop(db_guard);
+            *state.currently_crawling.write().await = None;
+            continue;
+        }
+
         state.current_degree.store(degree, Ordering::SeqCst);
 
         info!("Crawling: {scope} (degree {degree})");
