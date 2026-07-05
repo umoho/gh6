@@ -206,9 +206,6 @@ pub async fn run_daemon(
 
     // 8. Accept client connections (until shutdown)
     loop {
-        if state.shutdown.load(Ordering::SeqCst) {
-            break;
-        }
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -225,6 +222,12 @@ pub async fn run_daemon(
                     Err(e) => {
                         error!("Accept error: {e}");
                     }
+                }
+            }
+            // Periodically wake up to check shutdown flag.
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if state.shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
             }
         }
