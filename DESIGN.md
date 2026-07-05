@@ -153,52 +153,170 @@ Client                            Server (gh6d)
 ### 位置
 `~/.local/share/gh6/gh6.db`
 
+### 设计哲学：稳定层 + 扩展层
+
+遵循开闭原则——对扩展开放，对修改封闭。表分为两层：
+
+- **稳定层**（不会改）：`users` 身份注册表 + `edges` 关系边，是图的骨架
+- **扩展层**（加功能 = 加表）：`user_profiles`、`edge_history`、未来的 `repos`、`orgs` 等
+
+```
+┌─────────────────────────────────────────────┐
+│ 稳定层                                       │
+│                                             │
+│  users     — 身份注册表（login → id）          │
+│  edges     — 通用关系边，带生命周期              │
+│                                             │
+├─────────────────────────────────────────────┤
+│ 扩展层                                       │
+│                                             │
+│  user_profiles   资料快照                      │
+│  edge_history    关系变更日志                   │
+│  crawl_state     爬取进度                      │
+│  (未来) repos    仓库                          │
+│  (未来) orgs     组织                          │
+│  (未来) snapshots 图快照                       │
+│  ...                                         │
+└─────────────────────────────────────────────┘
+```
+
+### 数据流：两条线互不干扰
+
+GitHub API 有两种返回，走不同的入库路径：
+
+| API | 返回内容 | 写入目标 |
+|-----|---------|---------|
+| `GET /users/{login}/following` | 摘要列表（只有 login + avatar_url） | `users`（新发现） + `edges`（关系） |
+| `GET /users/{login}` | 完整 profile（following 数、name 等） | `user_profiles`（资料） |
+
+摘要 API 绝不碰 `user_profiles`，完整 API 绝不碰 `edges`。物理隔离，从架构上杜绝了摘要数据覆盖 profile 的问题。
+
 ### 表结构
 
 ```sql
--- 用户基础信息
+-- ============================================
+-- 稳定层
+-- ============================================
+
+-- 用户身份（login 仅从摘要 API 新发现时写入，之后不再修改）
 CREATE TABLE users (
-    id            INTEGER PRIMARY KEY,
-    login         TEXT NOT NULL UNIQUE,
-    name          TEXT,
-    avatar_url    TEXT,
-    company       TEXT,
-    location      TEXT,
-    followers     INTEGER,
-    following     INTEGER,
-    public_repos  INTEGER,
-    created_at    TEXT,
-    updated_at    TEXT
+    id             INTEGER PRIMARY KEY,
+    login          TEXT NOT NULL UNIQUE,
+    discovered_at  TEXT DEFAULT (datetime('now'))
 );
 
--- 通用多类型关系边
+-- 通用关系边（带生命周期）
 CREATE TABLE edges (
     from_user_id   INTEGER NOT NULL REFERENCES users(id),
     to_user_id     INTEGER NOT NULL REFERENCES users(id),
-    edge_type      TEXT NOT NULL,      -- 'follows', 'followed_by', 'starred_same_repo', ...
+    edge_type      TEXT NOT NULL,      -- 'follows', 'starred', 'org_member', ...
     weight         REAL DEFAULT 1.0,
     degree         INTEGER,            -- 从种子用户出发的 BFS 度数
     metadata       TEXT,               -- JSON: {"repo_id":123, "org_id":456, ...}
-    discovered_at  TEXT DEFAULT (datetime('now')),
+    is_active      INTEGER NOT NULL DEFAULT 1,  -- 1=当前有效, 0=已失效
+    first_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    removed_at     TEXT,               -- NULL = 仍然有效
     PRIMARY KEY (from_user_id, to_user_id, edge_type)
 );
 
--- 爬取进度跟踪（每个爬虫独立追踪）
+-- ============================================
+-- 扩展层（第一期）
+-- ============================================
+
+-- 用户资料（仅从完整 API 写入，摘要 API 绝不碰）
+CREATE TABLE user_profiles (
+    user_id        INTEGER PRIMARY KEY REFERENCES users(id),
+    name           TEXT,
+    avatar_url     TEXT,
+    company        TEXT,
+    location       TEXT,
+    followers      INTEGER NOT NULL,
+    following      INTEGER NOT NULL,
+    public_repos   INTEGER NOT NULL,
+    created_at     TEXT,
+    updated_at     TEXT,
+    fetched_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 关系变更日志（审计 / 回查）
+CREATE TABLE edge_history (
+    id             INTEGER PRIMARY KEY,
+    from_user_id   INTEGER NOT NULL,
+    to_user_id     INTEGER NOT NULL,
+    edge_type      TEXT NOT NULL,
+    action         TEXT NOT NULL,       -- 'added' | 'removed'
+    recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 爬取进度跟踪
 CREATE TABLE crawl_state (
-    crawler_name   TEXT NOT NULL,      -- 'follow_crawler', 'star_crawler', ...
-    scope_key      TEXT NOT NULL,      -- 爬取单元标识（user_id, repo_id, ...）
-    status         TEXT DEFAULT 'pending',  -- pending / done / error
+    crawler_name   TEXT NOT NULL,
+    scope_key      TEXT NOT NULL,
+    status         TEXT DEFAULT 'pending',
+    priority       TEXT DEFAULT 'normal',
     last_error     TEXT,
     crawled_at     TEXT,
     PRIMARY KEY (crawler_name, scope_key)
 );
+
+-- (未来) 仓库
+-- CREATE TABLE repos (
+--     id             INTEGER PRIMARY KEY,
+--     owner          TEXT NOT NULL,
+--     name           TEXT NOT NULL,
+--     stars          INTEGER,
+--     ...
+-- );
+
+-- (未来) 图快照
+-- CREATE TABLE snapshots (
+--     id             INTEGER PRIMARY KEY,
+--     label          TEXT,
+--     created_at     TEXT DEFAULT (datetime('now'))
+-- );
+-- CREATE TABLE snapshot_edges (
+--     snapshot_id    INTEGER REFERENCES snapshots(id),
+--     from_user_id   INTEGER,
+--     to_user_id     INTEGER,
+--     edge_type      TEXT,
+--     ...
+-- );
 ```
+
+### 边的生命周期
+
+```
+[首次发现] ──→ is_active=1 ──→ [再爬时没看到] ──→ is_active=0, removed_at=now
+                            ──→ [又看到了] ──→ is_active=1, removed_at=NULL
+```
+
+| 状态 | 条件 |
+|------|------|
+| active（当前有效） | `is_active = 1` |
+| removed（已失效） | `is_active = 0` |
+| 某时间点有效 | `first_seen_at <= T AND (removed_at IS NULL OR removed_at > T)` |
+
+每次边的状态变化都记录到 `edge_history`，可以回答"谁在什么时候 unfollow 了谁"。
+
+图查询（BFS、最短路径等）只需加 `WHERE is_active = 1`，其他逻辑不变。
+
+### profile 更新策略
+
+资料是快照，需要定期刷新以反映变化。两种方式互补：
+
+- **惰性更新**：爬某用户前检查 `user_profiles.fetched_at`，超过阈值则先调完整 API 刷新
+- **主动更新**：后台任务查询过期 profile（`fetched_at < datetime('now', '-7 days')`），批量刷新
+
+`user_profiles` 不存在 = 还没查过，排最高优先级先取。解决了此前 `following=0` 导致排程混乱的问题。
 
 ### 设计原则
 
 - 新维度的关系直接插入 `edges`，添加新 `edge_type` 即可，不需改表结构
 - `metadata` JSON 字段承载该边类型的专属信息，无需为每种边建专门字段
 - 新爬虫实现后直接在 `crawl_state` 登记，复用同一套断点续传机制
+- **新功能 = 加表，不动稳定层**：`user_profiles`、`edge_history` 都是外挂的，以后 `repos`、`orgs`、`snapshots` 同理
+- 摘要数据写入 `users` + `edges`，profile 数据写入 `user_profiles`，两条线物理隔离
 
 ## 爬虫核心
 
@@ -213,15 +331,20 @@ CREATE TABLE crawl_state (
 ### BFS 流程
 
 ```
-1. 查询 crawl_state 中 crawler_name='follow_crawler' 且 status='pending' 的最小 degree
-2. 取 scope_key（user login），调用 GitHub API 获取该用户的 following 列表
-3. 将新发现的用户写入 users 表（如不存在）
-4. 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1）
-5. 对于每个新发现用户，在 crawl_state 中创建 pending 记录（degree+1）
-6. 将该 scope_key 标记为 done
-7. 检查 AtomicBool 是否应停止
-8. 检查速率限制，sleep 或继续下一个
+1. 查询 crawl_state 中 crawler_name='follow_crawler' 且 status='pending' 的 scope（优先 low degree）
+2. 取 scope_key（user login）
+3. 如果 user_profiles 中无此用户或 fetched_at 过期，调 GET /users/{login} 获取完整 profile
+4. 调 GET /users/{login}/following 获取该用户的关注列表（摘要）
+5. 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
+6. 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1, is_active=1）
+7. 对于每个新发现用户，在 crawl_state 中创建 pending 记录（degree+1）
+8. 将该 scope_key 标记为 done
+9. 检查 AtomicBool 是否应停止
+10. 检查速率限制，sleep 或继续下一个
 ```
+
+与旧流程的关键差异：`users` 表只存 login，profile 数据独立写入 `user_profiles`，
+摘要 API 返回的 `GithubUser` 不再用于 upsert profile 字段。
 
 ### 扩展预留
 

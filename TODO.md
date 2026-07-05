@@ -1,5 +1,22 @@
 # TODO
 
+## 本次重构：数据库拆分 (v3)
+
+- [ ] 写 migration 003_split_profiles.sql（拆 users → users + user_profiles）
+- [ ] 新增 migration 004_edge_lifecycle.sql（edges 加 is_active / first_seen_at / last_seen_at / removed_at）
+- [ ] 新增 migration 005_edge_history.sql（edge_history 表）
+- [ ] 更新 `types.rs`：User 拆分 / GithubUser 拆分
+- [ ] 更新 `github.rs`：GhUser 字段改为 Option<i64>，区分 null vs 0
+- [ ] 更新 `db.rs`：
+  - [ ] upsert_user → insert_user(login) + upsert_profile
+  - [ ] 所有读 users 的查询 JOIN user_profiles
+  - [ ] pending_scopes 排序：user_profiles 缺失的排最前
+- [ ] 更新 `crawlers/mod.rs`：crawl_following 写 users（只插 login）不碰 profile
+- [ ] 更新 `server.rs`：crawl_loop 惰性 fetch profile 逻辑适配新表
+- [ ] 更新 `analyze.rs`：所有读 User 的地方适配新结构
+- [ ] 更新 `main.rs` 的导出等逻辑
+- [ ] migration 脚本：迁移现有数据（users → users + user_profiles）
+
 ## 基础设施
 
 - [x] 初始化 Rust 项目（Cargo.toml、依赖：tokio, rusqlite, reqwest, serde, serde_json, clap）
@@ -64,3 +81,13 @@
 - [x] SQLite WAL 模式
 - [x] Ctrl+C / SIGTERM 优雅处理（signal handler）
 - [ ] 数据库迁移框架（简单版：version table）
+
+## 未来功能（尚未排期）
+
+- [ ] profile 惰性刷新（crawl 前检查 fetched_at 过期则重新 fetch）
+- [ ] profile 主动更新（后台任务定时刷新过期 profile）
+- [ ] 关系变更检测（对比新 following 列表与现有 edges，记录 unfollow / refollow）
+- [ ] StarCrawler、OrgCrawler 等新爬虫
+- [ ] 图快照（snapshots 表，支持时间点对比）
+- [ ] PageRank / Betweenness 中心性分析
+- [ ] 社区发现（Louvain）优化
