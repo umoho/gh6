@@ -103,8 +103,10 @@ pub struct DegreeDist {
 
 #[derive(Debug)]
 pub struct CrawlResult {
-    pub new_users: Vec<GithubUserSummary>,
+    pub following: Vec<GithubUserSummary>,
     pub new_edges: Vec<NewEdge>,
+    /// Logins that were actually added to crawl_state (not already known).
+    pub newly_queued: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

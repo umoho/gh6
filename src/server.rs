@@ -406,16 +406,19 @@ async fn crawl_loop(
                 });
 
                 let next_degree = degree + 1;
-                for user in &crawl_result.new_users {
+                // Only send UserQueued for logins that were actually added
+                // to crawl_state (newly discovered), not for the entire
+                // following list.
+                for login in &crawl_result.newly_queued {
                     let _ = state.event_tx.send(CrawlEvent::UserQueued {
-                        login: user.login.clone(),
+                        login: login.clone(),
                         degree: next_degree,
                     });
                 }
 
                 info!(
                     "Done: {new_connections} new connections, {} users in following",
-                    crawl_result.new_users.len()
+                    crawl_result.following.len()
                 );
             }
             Err(e) => {

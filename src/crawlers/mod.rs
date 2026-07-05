@@ -79,8 +79,9 @@ impl FollowCrawler {
 
         // Phase 3: persist results to DB (lock held for bulk writes)
         let next_degree = current_degree + 1;
-        let mut new_users = Vec::with_capacity(following.len());
+        let mut all_following = Vec::with_capacity(following.len());
         let mut new_edges = Vec::with_capacity(following.len());
+        let mut newly_queued = Vec::new();
 
         {
             let db_guard = db.lock().await;
@@ -103,17 +104,19 @@ impl FollowCrawler {
                 let already_crawled = db_guard.has_crawl_state(crawler_name, &summary.login)?;
                 if !already_crawled {
                     db_guard.insert_pending_scope(crawler_name, &summary.login, next_degree)?;
+                    newly_queued.push(summary.login.clone());
                 }
 
-                new_users.push(summary.clone());
+                all_following.push(summary.clone());
             }
 
             db_guard.mark_crawl_done(crawler_name, login)?;
         }
 
         Ok(CrawlResult {
-            new_users,
+            following: all_following,
             new_edges,
+            newly_queued,
         })
     }
 }
