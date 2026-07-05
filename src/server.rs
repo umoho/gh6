@@ -654,6 +654,8 @@ fn build_status_data(
 ) -> Result<StatusData, Box<dyn std::error::Error>> {
     let users_crawled = db.get_crawled_count(crawler_name)? as u64;
     let users_queued = db.pending_scopes(crawler_name, 10_000_000)?.len() as u64;
+    let users_retry = db.get_retry_count(crawler_name)? as u64;
+    let users_error = db.get_error_count(crawler_name)? as u64;
     let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
     let api_limit = state.api_limit.load(Ordering::SeqCst);
@@ -664,6 +666,8 @@ fn build_status_data(
     Ok(StatusData {
         users_crawled,
         users_queued,
+        users_retry,
+        users_error,
         current_degree,
         api_remaining,
         api_limit,

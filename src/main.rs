@@ -340,11 +340,15 @@ fn progress_line(s: &StatusData) -> String {
     // Compute plain-text widths for padding (before colorizing)
     let deg = format!("{}°", s.current_degree);
     let left_plain = format!(
-        "{} {}  {} {}  {}  {} {}",
+        "{} {}  {} {}  {} {}  {} {}  {}  {} {}",
         "已爬",
         fmt_thousands(s.users_crawled),
         "队列",
         fmt_thousands(s.users_queued),
+        "重试",
+        fmt_thousands(s.users_retry),
+        "错误",
+        fmt_thousands(s.users_error),
         deg,
         "正在",
         cc,
@@ -375,11 +379,15 @@ fn progress_line(s: &StatusData) -> String {
     };
 
     let left = format!(
-        "{} {}  {} {}  {}  {} {}",
+        "{} {}  {} {}  {} {}  {} {}  {}  {} {}",
         "已爬".dimmed(),
         fmt_thousands(s.users_crawled).green(),
         "队列".dimmed(),
         fmt_thousands(s.users_queued).dimmed(),
+        "重试".dimmed(),
+        fmt_thousands(s.users_retry).yellow(),
+        "错误".dimmed(),
+        fmt_thousands(s.users_error).red(),
         deg.cyan(),
         "正在".dimmed(),
         cc.blue(),
@@ -437,6 +445,14 @@ fn print_status(data: &StatusData, json: bool) {
         StatusRow {
             label: "已爬".into(),
             value: fmt_thousands(data.users_crawled),
+        },
+        StatusRow {
+            label: "重试".into(),
+            value: fmt_thousands(data.users_retry),
+        },
+        StatusRow {
+            label: "错误".into(),
+            value: fmt_thousands(data.users_error),
         },
         StatusRow {
             label: "队列".into(),

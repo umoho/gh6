@@ -674,6 +674,28 @@ impl Db {
         Ok(count)
     }
 
+    /// Count how many scopes are awaiting retry.
+    pub fn get_retry_count(&self, crawler_name: &str) -> Result<i64, DbError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM crawl_state WHERE crawler_name = ?1 AND status = 'retry'",
+                params![crawler_name],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Count how many scopes have permanently errored.
+    pub fn get_error_count(&self, crawler_name: &str) -> Result<i64, DbError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM crawl_state WHERE crawler_name = ?1 AND status = 'error'",
+                params![crawler_name],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Return every edge in the database (active only).
     pub fn get_all_edges(&self) -> Result<Vec<Edge>, DbError> {
         let mut stmt = self.conn.prepare(

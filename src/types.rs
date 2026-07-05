@@ -117,6 +117,8 @@ pub struct CrawlResult {
 pub struct StatusData {
     pub users_crawled: u64,
     pub users_queued: u64,
+    pub users_retry: u64,
+    pub users_error: u64,
     pub current_degree: i32,
     pub api_remaining: u32,
     pub api_limit: u32,
