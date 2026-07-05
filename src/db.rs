@@ -546,55 +546,71 @@ impl Db {
     // Crawl state methods
     // -----------------------------------------------------------------------
 
-    /// Get pending scopes for a crawler using the three-tier strategy:
-    ///
-    /// 1. Degree 0-1: strict BFS (ORDER BY degree, priority)
-    /// 2. Degree 2:   BFS with hub deferral (priority first, then degree)
-    /// 3. Degree 3+:  random sampling
-    ///
-    /// Falls through tiers when the current tier is empty.
-    pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
+    /// Atomically claim a pending scope (status='pending' → 'in_progress').
+    /// This prevents multiple workers from grabbing the same scope.
+    /// Returns `None` if no pending scopes exist.
+    pub fn claim_scope(&self, crawler_name: &str) -> Result<Option<String>, DbError> {
         // Tier 1: degree 0-1, strict BFS
-        let mut stmt = self.conn.prepare(
-            "SELECT cs.scope_key FROM crawl_state cs \
-             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
-               AND cs.degree <= 1 \
-             ORDER BY cs.degree ASC, \
-                      CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END \
-             LIMIT ?2",
-        )?;
-        let mut rows: Vec<String> = stmt
-            .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !rows.is_empty() {
-            return Ok(rows);
+        let sql1 = "UPDATE crawl_state SET status = 'in_progress' \
+                    WHERE rowid = ( \
+                      SELECT rowid FROM crawl_state \
+                      WHERE crawler_name = ?1 AND status = 'pending' \
+                        AND degree <= 1 \
+                      ORDER BY degree ASC, \
+                        CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END \
+                      LIMIT 1 \
+                    ) RETURNING scope_key";
+        if let Ok(scope) = self
+            .conn
+            .query_row(sql1, params![crawler_name], |row| row.get::<_, String>(0))
+        {
+            return Ok(Some(scope));
         }
 
         // Tier 2: degree 2, BFS + hub deferral
-        let mut stmt2 = self.conn.prepare(
-            "SELECT cs.scope_key FROM crawl_state cs \
-             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
-               AND cs.degree = 2 \
-             ORDER BY CASE cs.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
-                      cs.degree ASC \
-             LIMIT ?2",
-        )?;
-        rows = stmt2
-            .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !rows.is_empty() {
-            return Ok(rows);
+        let sql2 = "UPDATE crawl_state SET status = 'in_progress' \
+                    WHERE rowid = ( \
+                      SELECT rowid FROM crawl_state \
+                      WHERE crawler_name = ?1 AND status = 'pending' \
+                        AND degree = 2 \
+                      ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
+                        degree ASC \
+                      LIMIT 1 \
+                    ) RETURNING scope_key";
+        if let Ok(scope) = self
+            .conn
+            .query_row(sql2, params![crawler_name], |row| row.get::<_, String>(0))
+        {
+            return Ok(Some(scope));
         }
 
         // Tier 3: degree 3+, random
-        let mut stmt3 = self.conn.prepare(
-            "SELECT cs.scope_key FROM crawl_state cs \
-             WHERE cs.crawler_name = ?1 AND cs.status = 'pending' \
-               AND cs.degree >= 3 \
-             ORDER BY RANDOM() \
+        let sql3 = "UPDATE crawl_state SET status = 'in_progress' \
+                    WHERE rowid = ( \
+                      SELECT rowid FROM crawl_state \
+                      WHERE crawler_name = ?1 AND status = 'pending' \
+                        AND degree >= 3 \
+                      ORDER BY RANDOM() \
+                      LIMIT 1 \
+                    ) RETURNING scope_key";
+        if let Ok(scope) = self
+            .conn
+            .query_row(sql3, params![crawler_name], |row| row.get::<_, String>(0))
+        {
+            return Ok(Some(scope));
+        }
+
+        Ok(None)
+    }
+
+    /// Get pending scopes for status display (includes 'in_progress').
+    pub fn pending_scopes(&self, crawler_name: &str, limit: usize) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_key FROM crawl_state \
+             WHERE crawler_name = ?1 AND status IN ('pending', 'in_progress') \
              LIMIT ?2",
         )?;
-        rows = stmt3
+        let rows = stmt
             .query_map(params![crawler_name, limit as i64], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)

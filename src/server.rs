@@ -272,9 +272,9 @@ async fn crawl_loop(
 
         let scope = {
             let db_guard = db.lock().await;
-            match db_guard.pending_scopes(crawler_name, 1) {
-                Ok(scopes) if !scopes.is_empty() => scopes.into_iter().next().unwrap(),
-                Ok(_) => {
+            match db_guard.claim_scope(crawler_name) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
                     // Queue empty — auto-pause and wait
                     state.paused.store(true, Ordering::SeqCst);
                     drop(db_guard);
