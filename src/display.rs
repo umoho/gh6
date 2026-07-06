@@ -758,12 +758,16 @@ impl fmt::Display for BridgesResult {
             header(
                 "🌉",
                 "桥梁节点",
-                &format!("top {}", dim(&self.bridges.len().to_string()))
+                &format!("{}", dim(&format!("top {}", self.bridges.len())))
             )
         )?;
-        writeln!(f, "隐藏后连通分量从 {} 增加", self.baseline_components)?;
+        writeln!(
+            f,
+            "\n隐藏后连通分量从 {} 增加",
+            self.baseline_components
+        )?;
 
-        let headers = ["#", "login", "关注", "粉丝", "关键性"];
+        let headers = ["#", "Login", "关注", "粉丝", "关键性"];
         let rows: Vec<Vec<String>> = self
             .bridges
             .iter()
