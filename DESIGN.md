@@ -29,16 +29,35 @@
 ## 命令体系
 
 ```
-gh6d                         启动守护进程（由 launchd / systemd 管理，无需手动调用）
-gh6 run                      开始 / 恢复爬取
-gh6 pause                    暂停爬取（守护进程保持运行）
-gh6 status [--watch]         查看进度 / 实时监控
+gh6d                             启动守护进程（由 launchd / systemd 管理，无需手动调用）
+gh6 run                          开始 / 恢复爬取
+gh6 pause                        暂停爬取（守护进程保持运行）
+gh6 status [--watch]             查看进度 / 实时监控
 
-gh6 analyze path <user>      查询从种子用户到目标用户的最短路径
-gh6 analyze neighbors <user> 查询某用户的直接连接
-gh6 analyze degree-dist      各度数的人数分布
+gh6 analyze route <LOGIN>        查询从种子用户到目标用户的最短路径
+             [--from <LOGIN>]    指定起点（默认读取 config seed）
+             [--limit <N>]       显示前 N 条路径（默认 1，0 = 全部）
+             [--fuzzy]           模糊搜索模式
 
-gh6 export <file>            导出当前图谱（JSON 格式）
+gh6 analyze common <LOGIN> <LOGIN>  查询两用户共同关注和共同粉丝
+               [--limit <N>]        结果上限
+
+gh6 analyze user <LOGIN>            用户档案与社交关系
+             [--detail]             显示完整列表（默认截断 10 人）
+
+gh6 analyze suggest <LOGIN>         基于共同关注的用户推荐
+               [--limit <N>]        推荐数量（默认 20）
+
+gh6 analyze bridges                 发现桥梁节点
+               [--limit <N>]        结果上限（默认 20）
+
+gh6 analyze communities             社区发现（Louvain 算法）
+               [--limit <N>]        显示社区数（默认 10）
+               [--user <LOGIN>]     查询某用户所在社区
+
+gh6 analyze stats                   数据库与图统计概览
+
+gh6 analyze export <FILE>           导出图到 JSON 文件
 ```
 
 - `status` / `run` / `pause` 通过 Unix socket 与守护进程通信
@@ -410,15 +429,84 @@ struct CrawlResult {
 所有分析子命令直读 SQLite，不依赖爬虫进程。
 
 | 子命令 | 实现思路 |
-|--------|---------|
-| `analyze path <u>` | BFS/双向BFS 在 edges 表上查找从 seed → target 的最短路径 |
-| `analyze neighbors <u>` | 查询 edges 中 from/to 该用户的边，汇总展示 |
-| `analyze degree-dist` | GROUP BY degree 统计人数分布 |
+|--------|--------—|
+| `route` | BFS 最短路径 + DFS 全路径搜索，支持模糊匹配 |
+| `common` | SQL JOIN 查找共同关注 / 共同粉丝 |
+| `user` | LEFT JOIN user_profiles + 边表查找关注/粉丝/互关 |
+| `suggest` | Adamic-Adar 加权推荐算法 |
+| `bridges` | 模拟移除每个节点，检测连通分量变化 |
+| `communities` | Louvain 社区检测算法，含模块度 Q 值 |
+| `stats` | 聚合查询：用户数、边数、度数分布、图密度、连通分量 |
+| `export` | 全量导出 users + edges 到 JSON |
 
-后续可扩展（预加载图到内存用 petgraph/networkx 算法）：
-- 中心性分析（Betweenness, PageRank）
-- 社区发现（Louvain）
-- 用户画像聚类
+## 显示架构 (Display Kit)
+
+### 设计原则
+
+- **数据与视图分离**：`analyze.rs` 生产类型化结果，`display/` 模块负责渲染
+- **`impl Display` trait**：每个输出类型实现 `fmt::Display`，`main.rs` 只需 `println!("{}", data)`
+- **显示变体 = newtype wrapper**：如 `RouteWithStats(pub &RouteResult)`，不同 flag 组合对应不同 newtype
+- **部件化组合**：所有子命令由有限的绘制原语拼接，杜绝各画各的
+
+### 绘制原语
+
+#### 布局级
+
+| 原语 | 说明 |
+|------|------|
+| `header(emoji, title, meta?)` | 统一头部，如 `🗺️ umoho 到 torvalds 共 100 条路径，显示前 5 条` |
+| `section(title)` | 区块标题，如 `基本信息` |
+| `tree_block(title, items)` | 树形缩进块，`title` 为根，items 为 `├ / └` 子项 |
+| `nested_tree(title, groups)` | 多层树形，如 user 社交关系含三级缩进 |
+| `card(head, body)` | 卡片式条目：head 行 + `└` body 行（suggest、route、communities） |
+| `spacer()` | 空行 |
+| `footer(text)` | dim 脚注 |
+
+#### 行内级
+
+| 原语 | 说明 |
+|------|------|
+| `tree_line(prefix, label, value)` | `├ 姓名  umoho` |
+| `arrow_line(arrow, label)` | `→ 关注 10 人` |
+| `path_chain(users)` | `umoho · sinsong · torvalds` |
+| `directed_edge(from, to)` | `umoho → sinsong` |
+| `num(n)` | `301,434`（千分位） |
+| `bar(value, max, width)` | `██████` |
+| `weight_bar(value, max, width)` | `████`（渐变色） |
+
+#### 网格级
+
+| 原语 | 说明 |
+|------|------|
+| `align_grid(rows)` | 无边框列对齐（bridges、stats、status） |
+
+#### 样式 token
+
+| token | 说明 |
+|-------|------|
+| `dim` / `bold` | 强调层级 |
+| `blue` / `green` / `yellow` / `red` / `cyan` | 语义着色 |
+| `density_color(d)` / `impact_color(n)` / `modularity_color(q)` | 阈值着色 |
+
+### 子命令渲染组成
+
+| 子命令 | 组成 |
+|--------|------|
+| `route` | header → card(path_chain, directed_edges…) |
+| `common` | header → tree_block(共同关注) → tree_block(共同粉丝) |
+| `user` | header → tree_block × 3（基本信息/统计/社交关系），社交关系为 nested_tree |
+| `suggest` | header → card(login + weight_bar, `└` friends) → footer |
+| `bridges` | header → align_grid |
+| `communities` | header → card(#N 人, `└` reps) × N → `--user` 追加 list |
+| `stats` | header → align_grid (KV) → degree bars |
+| `export` | header 一行 |
+
+### 样式约定
+
+- **不使用括号**：`（未爬取）` → `未爬取` (dim)，`—` 表示 `未填写` (dim)
+- **统计数字内联标签**：`关注 10 人` 而非 `关注 (10)`
+- **不依赖 tabled crate**：所有显示自行绘制，零外部显示依赖
+- **`--json` 输出不受影响**：serde 序列化原数据，不走 display 层
 
 ## 技术栈
 
