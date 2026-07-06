@@ -1022,7 +1022,7 @@ fn kv_to_tree_nodes(items: &[(&str, String)]) -> Vec<TreeNode> {
 
 /// Render a titled tree list (used by common view).
 fn tree_title_list(label: &str, list: &[String]) -> String {
-    let title = format!("{} {} 人", dim(label), list.len());
+    let title = format!("{} {}", bold(label), suffix(&format!("{} 人", list.len())));
     if list.is_empty() {
         return tree(&title, &[TreeNode::leaf(dim("无"))]);
     }
