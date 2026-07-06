@@ -700,8 +700,23 @@ impl fmt::Display for SuggestResult {
             let friends_line = if s.mutual_friends.is_empty() {
                 suffix("无")
             } else {
-                let truncated = truncate_list(&s.mutual_friends, 3);
-                format!("{truncated} {}", suffix("也关注了 ta"))
+                let max_show = 3;
+                let names: Vec<&str> = s
+                    .mutual_friends
+                    .iter()
+                    .take(max_show)
+                    .map(|n| n.as_str())
+                    .collect();
+                let remaining = s.mutual_friends.len().saturating_sub(max_show);
+                if remaining == 0 {
+                    format!("{} {}", names.join(", "), suffix("也关注了 ta"))
+                } else {
+                    format!(
+                        "{} {}",
+                        names.join(", "),
+                        suffix(&format!("等 {} 人也关注了 ta", remaining))
+                    )
+                }
             };
 
             let body = vec![TreeNode::leaf(friends_line)];
