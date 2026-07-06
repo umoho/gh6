@@ -919,11 +919,18 @@ impl fmt::Display for StatsResult {
             write!(f, "\n  {}", dim("（无数据）"))?;
         } else {
             let max_count = self.degree_dist.iter().map(|d| d.count).max().unwrap_or(1) as u64;
+            let max_cnt_w = self
+                .degree_dist
+                .iter()
+                .map(|d| visible_width(&num(d.count as u64)))
+                .max()
+                .unwrap_or(0);
             for d in &self.degree_dist {
                 let b = bar(d.count as u64, max_count, 30);
                 let deg = cyan(&d.degree.to_string());
                 let cnt = num(d.count as u64);
-                write!(f, "\n    {deg}°  {cnt}  {b}")?;
+                let cnt_pad = max_cnt_w.saturating_sub(visible_width(&cnt));
+                write!(f, "\n    {deg}°  {}{}  {b}", " ".repeat(cnt_pad), cnt)?;
             }
         }
 
