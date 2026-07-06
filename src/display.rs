@@ -609,17 +609,23 @@ impl fmt::Display for UserView<'_> {
             .max()
             .unwrap_or(0);
 
+        let max_crawled_w = [d.crawled_following, d.crawled_followers]
+            .iter()
+            .map(|n| format!("{n}").len())
+            .max()
+            .unwrap_or(0);
+
         let stat_nodes = vec![
             TreeNode::leaf(format!(
                 "关注      {:>w$}  {}",
                 follow_val,
-                dim(&format!("已获取 {} 人", d.crawled_following)),
+                dim(&format!("已获取 {:>cw$} 人", d.crawled_following, cw = max_crawled_w)),
                 w = max_w
             )),
             TreeNode::leaf(format!(
                 "粉丝      {:>w$}  {}",
                 follower_val,
-                dim(&format!("已获取 {} 人", d.crawled_followers)),
+                dim(&format!("已获取 {:>cw$} 人", d.crawled_followers, cw = max_crawled_w)),
                 w = max_w
             )),
             TreeNode::leaf(format!("公开仓库  {:>w$}", repo_val, w = max_w)),

@@ -443,7 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!(
+                        println!(
                             "{}",
                             UserView {
                                 data: &result,
