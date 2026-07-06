@@ -701,7 +701,7 @@ impl fmt::Display for SuggestResult {
                 suffix("无")
             } else {
                 let truncated = truncate_list(&s.mutual_friends, 3);
-                suffix(&format!("{truncated}也关注了 ta"))
+                format!("{truncated} {}", suffix("也关注了 ta"))
             };
 
             let body = vec![TreeNode::leaf(friends_line)];
