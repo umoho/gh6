@@ -445,66 +445,220 @@ struct CrawlResult {
 
 - **数据与视图分离**：`analyze.rs` 生产类型化结果，`display/` 模块负责渲染
 - **`impl Display` trait**：每个输出类型实现 `fmt::Display`，`main.rs` 只需 `println!("{}", data)`
-- **显示变体 = newtype wrapper**：如 `RouteWithStats(pub &RouteResult)`，不同 flag 组合对应不同 newtype
+- **显示变体 = newtype wrapper**：如 `UserView { data, detail }`，不同 flag 组合对应不同 newtype
 - **部件化组合**：所有子命令由有限的绘制原语拼接，杜绝各画各的
 
 ### 绘制原语
 
-#### 布局级
+所有树形布局统一为一个 `tree` 原语。`card`、`tree_block`、`tree_grid`、`nested_tree` 都是它的特例。
 
-| 原语 | 说明 |
-|------|------|
-| `header(emoji, title, meta?)` | 统一头部，如 `🗺️ umoho 到 torvalds 共 100 条路径，显示前 5 条` |
-| `section(title)` | 区块标题，如 `基本信息` |
-| `tree_block(title, items)` | 树形缩进块，`title` 为根，items 为 `├ / └` 子项 |
-| `nested_tree(title, groups)` | 多层树形，如 user 社交关系含三级缩进 |
-| `card(head, body)` | 卡片式条目：head 行 + `└` body 行（suggest、route、communities） |
-| `spacer()` | 空行 |
-| `footer(text)` | dim 脚注 |
+#### 核心原语
+
+```rust
+pub struct TreeNode {
+    /// This line's content (pre-formatted by caller).
+    pub content: String,
+    /// Child nodes (empty = leaf).
+    pub children: Vec<TreeNode>,
+}
+
+/// Render a tree with `├` / `└` / `│` prefixes.
+///
+/// ```text
+///   root                          ← level 0, no prefix
+///   ├ item1                       ← level 1
+///   │ ├ item1.child1              ← level 2
+///   │ └ item1.child2
+///   └ item2                       ← level 1
+/// ```
+pub fn tree(root: &str, items: &[TreeNode]) -> String;
+```
+
+| 原语 | 说明 | 内部用 tree? |
+|------|------|------------|
+| `tree(root, items)` | 统一树形 — 所有缩进来源于此 | — |
+| `header(emoji, title, meta)` | 统一头部，如 `🗺️ A 到 B 共 100 条路径` | ✗ |
+| `align_grid(headers, rows)` | 无边框列对齐（bridges）。宽度计算剥 ANSI | ✗ |
+| `footer(text)` | dim 脚注 | ✗ |
 
 #### 行内级
 
 | 原语 | 说明 |
 |------|------|
-| `tree_line(prefix, label, value)` | `├ 姓名  umoho` |
-| `arrow_line(arrow, label)` | `→ 关注 10 人` |
-| `path_chain(users)` | `umoho · sinsong · torvalds` |
-| `directed_edge(from, to)` | `umoho → sinsong` |
+| `path_chain(users)` | `alice · bob · eve` — 起点 bold，终点 green+bold，`·` dim |
+| `directed_edge(from, to)` | `alice dim(→) bob` |
 | `num(n)` | `301,434`（千分位） |
-| `bar(value, max, width)` | `██████` |
-| `weight_bar(value, max, width)` | `████`（渐变色） |
-
-#### 网格级
-
-| 原语 | 说明 |
-|------|------|
-| `align_grid(rows)` | 无边框列对齐（bridges、stats、status） |
+| `bar(value, max, width)` | `████`（monochrome） |
+| `weight_bar(value, max, width)` | `████`（green→yellow→red 渐变） |
+| `visible_width(s)` | 剥 ANSI escape 后计算 Unicode 显示宽度 |
 
 #### 样式 token
 
+**三层色彩体系：**
+
+| 层级 | 用途 | token |
+|------|------|-------|
+| L0 本体 | 数字、中文正文、普通 login | regular（无色） |
+| L1 强调 | 用户 login、路径终点、阈值告警 | `blue`, `green`+`bold`, `red`/`yellow`/`green` |
+| L2 辅助 | 标签、解释、占位符 | `dim` |
+
 | token | 说明 |
 |-------|------|
-| `dim` / `bold` | 强调层级 |
-| `blue` / `green` / `yellow` / `red` / `cyan` | 语义着色 |
+| `dim(s)` | 灰底辅助文本 |
+| `bold(s)` | 粗体强调 |
+| `blue(s)` / `green(s)` / `yellow(s)` / `red(s)` / `cyan(s)` | 语义着色 |
+| `suffix(s)` | 解释性后缀，等价 `dim(s)`（如 `为代表`、`也关注了 ta`） |
 | `density_color(d)` / `impact_color(n)` / `modularity_color(q)` | 阈值着色 |
 
 ### 子命令渲染组成
 
-| 子命令 | 组成 |
-|--------|------|
-| `route` | header → card(path_chain, directed_edges…) |
-| `common` | header → tree_block(共同关注) → tree_block(共同粉丝) |
-| `user` | header → tree_block × 3（基本信息/统计/社交关系），社交关系为 nested_tree |
-| `suggest` | header → card(login + weight_bar, `└` friends) → footer |
-| `bridges` | header → align_grid |
-| `communities` | header → card(#N 人, `└` reps) × N → `--user` 追加 list |
-| `stats` | header → align_grid (KV) → degree bars |
-| `export` | header 一行 |
+#### route
+
+```text
+🗺️ bold(from) 到 green+bold(query)  dim(共 N 条路径)
+
+  bold(start) · mid · green+bold(end)  dim(N 步)
+  ├ from dim(→) to
+  └ ...
+```
+
+- header：from bold，target green+bold，meta dim
+- 每条路径：`tree(path_chain + dim(步数), [edges...])` — edges 没有 children
+- fuzzy：`tree(blue(matched_login), [TreeNode { content: path_chain, children: edges }])`
+
+#### common
+
+```text
+👥 blue(A) 和 blue(B)
+
+  dim(共同关注) 3 人
+  ├ user1
+  └ user2
+
+  dim(共同粉丝) 0 人
+  └ dim(无)
+```
+
+- 标签 `共同关注`/`共同粉丝` 用 dim，数字 regular
+
+#### user
+
+```text
+👤 blue(login)
+
+  基本信息
+  ├ 姓名      value
+  ├ 公司      dim(—)
+  └ 账号创建  2020-01-15
+
+  统计
+  ├ 关注      12 人  dim(已获取 12 人)
+  ├ 粉丝       8 人  dim(已获取  3 人)    ← 数字右对齐
+  └ 公开仓库  41 个
+
+  社交关系
+  ├ bold(green(→) 关注) dim(10 人)
+  │ ├ user1
+  │ └ ...
+  ├ bold(yellow(⇄) 互关) dim(2 人)
+  │ └ ...
+  └ bold(cyan(←) 粉丝) dim(1 人)
+      └ ...
+```
+
+- 统计列内部右对齐（`{:>N}` pad），`已获取` 竖向对齐
+- 社交标签 bold + 箭头保留颜色，数字 dim
+- `profile_crawled` 为 false 时所有 value 显示 `dim(—)`
+
+#### suggest
+
+```text
+💡 基于 blue(A) 的社交圈推荐  dim(top N)
+
+  blue(login)  weight_bar  weight
+  └ suffix(等 N 人也关注了 ta)
+
+基于 dim(N) 个关注者，覆盖 dim(N) 个候选
+```
+
+- header `top N` dim
+- friends 行整体 dim（用 suffix）
+- footer 只有数字 dim，中文正文 regular
+
+#### bridges
+
+```text
+🌉 桥梁节点  dim(top N)
+隐藏后连通分量从 N 增加
+
+  dim(#)  bold(login)  bold(关注)  bold(粉丝)  bold(关键性)
+  dim(#1) blue(login1)  N  N  red(+N)
+  dim(#2) blue(login2)  ...
+```
+
+- 列标题行 bold
+- 行序号 dim
+- impact 阈值着色
+- `visible_width` 确保列宽计算不受 ANSI 影响
+
+#### communities
+
+```text
+🏘️ 社区发现  dim(共 N 个社区)
+
+  Louvain 算法  dim(模块度)  Q = green(N)
+
+  bold(ID)  N 人
+  └ alice, bob, eve suffix(为代表)
+
+仅显示前 dim(N) 个社区
+```
+
+- 社区 ID bold，不编号
+- Q 值阈值着色
+- `为代表` 用 suffix
+
+#### stats
+
+```text
+📊 gh6 数据库
+
+  数据库概况
+  ├ 用户总数  301,434
+  ├ ...
+
+  度数分布
+    3°   4,967  ██████████
+
+  图统计
+  ├ 边数          408,501
+  ├ 图密度        0.000004   ← 阈值着色
+  └ ...
+```
+
+- KV 对放在 `tree` 内，标题 bold
+- 度数分布独立（bar 图表不适合 tree）
+
+#### status
+
+```text
+⏳ gh6
+
+  状态
+  ├ 服务状态    ▶ 运行中
+  ├ 已爬        5,623
+  ├ ...
+  └ 运行时间    2h 3m 5s
+```
+
+- 去掉 header 上的 uptime（下面已显示）
+- KV 对用 `tree` 收拢
 
 ### 样式约定
 
-- **不使用括号**：`（未爬取）` → `未爬取` (dim)，`—` 表示 `未填写` (dim)
+- **不使用括号**：`未爬取` (dim)，`—` 表示 `未填写` (dim)
 - **统计数字内联标签**：`关注 10 人` 而非 `关注 (10)`
+- **所有解释性后缀**：`为代表`、`也关注了 ta`、`已获取 N 人`、`等 N 人` → 统一用 `suffix()`
 - **不依赖 tabled crate**：所有显示自行绘制，零外部显示依赖
 - **`--json` 输出不受影响**：serde 序列化原数据，不走 display 层
 
