@@ -829,10 +829,11 @@ impl fmt::Display for CommunitiesResult {
             write!(f, "\n{}", tree(&head, &body))?;
 
             // Full member list for grep.
-            write!(f, "\n\n  同社区成员:")?;
-            for m in members {
-                write!(f, "\n    {m}")?;
-            }
+            let member_nodes: Vec<TreeNode> = members
+                .iter()
+                .map(|m| TreeNode::leaf(m.clone()))
+                .collect();
+            write!(f, "\n\n{}", tree(&bold("同社区成员"), &member_nodes))?;
             return Ok(());
         }
 
