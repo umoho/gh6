@@ -795,7 +795,7 @@ impl fmt::Display for CommunitiesResult {
             let cid = self.user_community.unwrap_or(0);
             let head = format!(
                 "{}  {} 人",
-                bold(&cid.to_string()),
+                bold(&format!("社区 {}", cid)),
                 num(members.len() as u64)
             );
             let reps = if members.is_empty() {
@@ -852,13 +852,12 @@ impl fmt::Display for CommunitiesResult {
         )?;
         writeln!(
             f,
-            "  Louvain 算法  {}  Q = {}",
-            dim("模块度"),
+            "\n  Louvain 算法  模块度 Q = {}",
             modularity_color(self.modularity)
         )?;
 
         for (ci, c) in self.communities.iter().enumerate() {
-            let head = format!("{}  {} 人", bold(&c.id.to_string()), num(c.size as u64));
+            let head = format!("{}  {} 人", bold(&format!("社区 {}", c.id)), num(c.size as u64));
             let reps = if c.representatives.is_empty() {
                 suffix("无")
             } else {
