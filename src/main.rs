@@ -382,7 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if cli.json {
                             println!("{}", serde_json::to_string(&s)?);
                         } else {
-                            print!("{s}");
+                            println!("{s}");
                         }
                     }
                     Ok(ServerResponse::Error { msg }) => {
@@ -423,7 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!("{result}");
+                        println!("{result}");
                     }
                 }
                 AnalyzeCommand::Common {
@@ -435,7 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!("{result}");
+                        println!("{result}");
                     }
                 }
                 AnalyzeCommand::User { login, detail } => {
@@ -457,7 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!("{result}");
+                        println!("{result}");
                     }
                 }
                 AnalyzeCommand::Bridges { limit } => {
@@ -465,7 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!("{result}");
+                        println!("{result}");
                     }
                 }
                 AnalyzeCommand::Communities { limit, user } => {
@@ -473,7 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&result)?);
                     } else {
-                        print!("{result}");
+                        println!("{result}");
                     }
                 }
                 AnalyzeCommand::Stats => {
@@ -481,7 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if cli.json {
                         println!("{}", serde_json::to_string(&stats)?);
                     } else {
-                        print!("{stats}");
+                        println!("{stats}");
                     }
                 }
                 AnalyzeCommand::Export { file } => {

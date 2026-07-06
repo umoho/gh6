@@ -6,26 +6,13 @@
 //! Each analyze result type implements [`fmt::Display`] by calling these
 //! primitives — no ad‑hoc `println!()` anywhere.
 //!
-//! # Primitives
-//!
-//! | Primitive       | Purpose                           |
-//! |-----------------|-----------------------------------|
-//! | `header`        | `🗺️ A 到 B  共 5 条路径`            |
-//! | `section`       | `基本信息`                         |
-//! | `tree_block`    | Single‑level key‑value tree        |
-//! | `nested_tree`   | Multi‑level tree (user social)     |
-//! | `card`          | Head + tree‑prefixed body lines    |
-//! | `align_grid`    | Borderless column‑aligned grid     |
-//! | `bar`           | Monochrome bar `████`              |
-//! | `weight_bar`    | Gradient bar (green→yellow→red)    |
-//! | `path_chain`    | `A · B · C`                        |
-//! | `spacer`        | Blank line                         |
-//! | `footer`        | Dimmed footnote                    |
+//! The core primitive is [`tree`]: every card, key‑value block, and nested
+//! list is a special case of a tree with `├` / `└` / `│` connectors.
 
 use std::fmt;
 
 use owo_colors::OwoColorize;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use crate::analyze::{
     BridgesResult, CommonResult, CommunitiesResult, PathInfo, RouteResult, StatsResult,
@@ -75,6 +62,11 @@ pub fn target(s: &str) -> String {
     s.green().bold().to_string()
 }
 
+/// Explanatory suffix — always dimmed.
+pub fn suffix(s: &str) -> String {
+    dim(s)
+}
+
 // ── Numeric formatting ────────────────────────────────────────────────────
 
 /// Format a u64 with thousands separators.
@@ -89,6 +81,31 @@ pub fn num(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+// ── ANSI‑aware width helper ───────────────────────────────────────────────
+
+/// Strip ANSI SGR escape sequences, then measure the visible display width.
+pub fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Skip ESC [ ... m
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'm' {
+                i += 1;
+            }
+            i += 1; // skip 'm'
+        } else if let Some(c) = s[i..].chars().next() {
+            width += UnicodeWidthChar::width(c).unwrap_or(0);
+            i += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    width
 }
 
 // ── Threshold colour helpers ──────────────────────────────────────────────
@@ -133,144 +150,97 @@ pub fn modularity_color(q: f64) -> String {
 
 /// Unified header: `{emoji} {title}  {meta}`.
 ///
-/// `meta` is always dimmed.  Pass an empty string to omit.
+/// Callers are responsible for styling `meta` (typically `dim()`).
+/// Pass an empty `meta` to omit.
 pub fn header(emoji: &str, title: &str, meta: &str) -> String {
     if meta.is_empty() {
         format!("{emoji} {title}")
     } else {
-        format!("{emoji} {title}  {}", dim(meta))
+        format!("{emoji} {title}  {meta}")
     }
-}
-
-/// Bold section title, e.g. `基本信息`.
-pub fn section(title: &str) -> String {
-    format!("  {}", bold(title))
-}
-
-/// Single blank line.
-pub fn spacer() -> &'static str {
-    "\n\n"
 }
 
 /// Dimmed footnote line.
 pub fn footer(text: &str) -> String {
-    format!("\n\n{}", dim(text))
+    format!("\n\n{text}")
 }
 
-// ── Tree primitives ───────────────────────────────────────────────────────
+// ── Tree primitive ────────────────────────────────────────────────────────
 
-/// A single key‑value row inside [`tree_block`].
-pub struct TreeItem {
-    pub key: String,
-    pub value: String,
+/// A node in the universal tree layout.
+pub struct TreeNode {
+    /// Pre‑formatted line content (styles already applied).
+    pub content: String,
+    /// Child nodes (empty = leaf).
+    pub children: Vec<TreeNode>,
 }
 
-impl TreeItem {
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+impl TreeNode {
+    /// Create a leaf node (no children).
+    pub fn leaf(content: impl Into<String>) -> Self {
         Self {
-            key: key.into(),
-            value: value.into(),
+            content: content.into(),
+            children: vec![],
+        }
+    }
+
+    /// Create a branch node with children.
+    pub fn with_children(content: impl Into<String>, children: Vec<TreeNode>) -> Self {
+        Self {
+            content: content.into(),
+            children,
         }
     }
 }
 
-/// Render a single‑level tree block:
+/// Render a tree rooted at `root` with `├` / `└` / `│` connectors.
 ///
 /// ```text
-///   section title
-///   ├ key1    val1
-///   ├ key2    val2
-///   └ key3    val3
+///   root
+///   ├ item1
+///   │ ├ item1.child1
+///   │ └ item1.child2
+///   └ item2
 /// ```
-pub fn tree_block(title: &str, items: &[TreeItem]) -> String {
-    let mut out = section(title).to_string();
-
-    let max_key_w = items
-        .iter()
-        .map(|it| UnicodeWidthStr::width(it.key.as_str()))
-        .max()
-        .unwrap_or(0);
-
-    for (i, item) in items.iter().enumerate() {
-        out.push('\n');
-        let prefix = if i == items.len() - 1 { "└ " } else { "├ " };
-        let key_w = UnicodeWidthStr::width(item.key.as_str());
-        let pad = max_key_w.saturating_sub(key_w);
-        out.push_str(&format!(
-            "  {prefix}{}{}  {}",
-            item.key,
-            " ".repeat(pad),
-            item.value
-        ));
-    }
-    out
-}
-
-/// A group of items inside [`nested_tree`].
-pub struct TreeGroup {
-    /// e.g. `→ 关注 10 人`
-    pub label: String,
-    /// Child items below the label.
-    pub items: Vec<String>,
-}
-
-/// Render a multi‑level tree (used for user social section):
-///
-/// ```text
-///   section title
-///   ├ → group 1
-///   │   ├ item a
-///   │   └ item b
-///   ├ ⇄ group 2
-///   │   └ item c
-///   └ ← group 3
-///       └ item d
-/// ```
-pub fn nested_tree(title: &str, groups: &[TreeGroup]) -> String {
-    let mut out = section(title).to_string();
-
-    for (gi, group) in groups.iter().enumerate() {
-        out.push('\n');
-        let group_last = gi == groups.len() - 1;
-        let g_prefix = if group_last { "└ " } else { "├ " };
-        let g_cont = if group_last { "  " } else { "│ " };
-
-        out.push_str(&format!("  {g_prefix}{}", group.label));
-
-        let last_idx = group.items.len().saturating_sub(1);
-        for (ii, item) in group.items.iter().enumerate() {
-            out.push('\n');
-            let item_last = ii == last_idx;
-            let i_prefix = if item_last { "└ " } else { "├ " };
-            out.push_str(&format!("  {g_cont}{i_prefix}{item}"));
-        }
-    }
-    out
-}
-
-/// Render a card: a head line followed by tree‑prefixed body lines.
-///
-/// ```text
-///   head
-///   ├ body 1
-///   └ body 2
-/// ```
-pub fn card(head: &str, body: &[String]) -> String {
-    let mut s = format!("  {head}");
-    if body.is_empty() {
+pub fn tree(root: &str, items: &[TreeNode]) -> String {
+    let mut s = format!("  {root}");
+    if items.is_empty() {
         return s;
     }
-    for (i, line) in body.iter().enumerate() {
+    let last_idx = items.len() - 1;
+    for (i, item) in items.iter().enumerate() {
         s.push('\n');
-        let prefix = if i == body.len() - 1 { "└ " } else { "├ " };
-        s.push_str(&format!("  {prefix}{line}"));
+        s.push_str(&render_node(item, i == last_idx, &[]));
     }
     s
 }
 
-// ── Grid primitives ───────────────────────────────────────────────────────
+/// Recursively render a tree node at the current ancestor path.
+fn render_node(node: &TreeNode, is_last: bool, ancestors: &[bool]) -> String {
+    // Build the prefix from ancestor continuations.
+    let prefix = ancestors
+        .iter()
+        .map(|&cont| if cont { "│ " } else { "  " })
+        .collect::<String>();
 
-/// Borderless column‑aligned grid.  The first row is dimmed (header).
+    let branch = if is_last { "└ " } else { "├ " };
+    let mut s = format!("  {prefix}{branch}{}", node.content);
+
+    if !node.children.is_empty() {
+        let mut next_ancestors = ancestors.to_vec();
+        next_ancestors.push(!is_last);
+        let last_idx = node.children.len() - 1;
+        for (i, child) in node.children.iter().enumerate() {
+            s.push('\n');
+            s.push_str(&render_node(child, i == last_idx, &next_ancestors));
+        }
+    }
+    s
+}
+
+// ── Grid primitive ────────────────────────────────────────────────────────
+
+/// Borderless column‑aligned grid.  Headers are bold; row `#` is dim.
 pub fn align_grid(headers: &[&str], rows: &[Vec<String>]) -> String {
     assert!(
         !headers.is_empty(),
@@ -278,27 +248,28 @@ pub fn align_grid(headers: &[&str], rows: &[Vec<String>]) -> String {
     );
     let ncols = headers.len();
 
-    // Compute column widths.
-    let mut widths: Vec<usize> = headers.iter().map(|h| UnicodeWidthStr::width(*h)).collect();
+    // Compute column widths using visible width (ANSI‑aware).
+    let mut widths: Vec<usize> = headers.iter().map(|h| visible_width(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < ncols {
-                widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+                widths[i] = widths[i].max(visible_width(cell));
             }
         }
     }
 
     let mut s = String::new();
 
-    // Header row.
+    // Header row (bold).
     for (i, h) in headers.iter().enumerate() {
         if i > 0 {
             s.push_str("  ");
         }
-        let w = UnicodeWidthStr::width(*h);
-        s.push_str(&dim(h));
+        let w = visible_width(h);
+        s.push_str(&bold(h));
         if i < ncols - 1 {
-            s.push_str(&" ".repeat(widths[i].saturating_sub(w)));
+            let pad = widths[i].saturating_sub(w);
+            s.push_str(&" ".repeat(pad));
         }
     }
 
@@ -309,10 +280,11 @@ pub fn align_grid(headers: &[&str], rows: &[Vec<String>]) -> String {
             if i > 0 {
                 s.push_str("  ");
             }
-            let w = UnicodeWidthStr::width(cell.as_str());
+            let w = visible_width(cell);
             s.push_str(cell);
             if i < ncols - 1 {
-                s.push_str(&" ".repeat(widths[i].saturating_sub(w)));
+                let pad = widths[i].saturating_sub(w);
+                s.push_str(&" ".repeat(pad));
             }
         }
     }
@@ -398,6 +370,22 @@ pub fn truncate_list(items: &[String], max: usize) -> String {
     format!("{} 等 {} 人", shown.join(", "), remaining)
 }
 
+/// Split a list into display items for use in tree nodes.
+fn list_to_leaves(items: &[String], max: usize) -> Vec<TreeNode> {
+    if items.len() <= max {
+        items.iter().map(|s| TreeNode::leaf(s.clone())).collect()
+    } else {
+        let mut out: Vec<TreeNode> = items
+            .iter()
+            .take(max)
+            .map(|s| TreeNode::leaf(s.clone()))
+            .collect();
+        let remaining = items.len() - max;
+        out.push(TreeNode::leaf(dim(&format!("等 {} 人", remaining))));
+        out
+    }
+}
+
 // ── Uptime helper ─────────────────────────────────────────────────────────
 
 pub fn fmt_uptime(secs: u64) -> String {
@@ -423,7 +411,7 @@ impl fmt::Display for RouteResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.paths.is_empty() {
             if self.is_fuzzy {
-                write!(
+                writeln!(
                     f,
                     "{}",
                     header(
@@ -433,7 +421,7 @@ impl fmt::Display for RouteResult {
                     )
                 )?;
             } else {
-                write!(
+                writeln!(
                     f,
                     "{}",
                     header(
@@ -450,9 +438,17 @@ impl fmt::Display for RouteResult {
             return Ok(());
         }
 
+        let meta = if self.total > self.paths.len() {
+            dim(&format!("共 {} 条路径", self.total))
+        } else if self.total == 1 {
+            dim("共 1 条路径")
+        } else {
+            dim(&format!("共 {} 条路径", self.total))
+        };
+
         if self.is_fuzzy {
             // Fuzzy: per‑matched‑user cards.
-            write!(
+            writeln!(
                 f,
                 "{}",
                 header(
@@ -462,69 +458,69 @@ impl fmt::Display for RouteResult {
                 )
             )?;
 
-            for info in &self.paths {
+            for (pi, info) in self.paths.iter().enumerate() {
                 let target_login = info.path.last().map(|u| u.login.as_str()).unwrap_or("?");
                 let chain = build_path_chain(info);
                 let steps = dim(&format!("{} 步", info.path.len().saturating_sub(1)));
-                let mut body = vec![format!("{chain}  {steps}")];
-                if info.path.len() > 2 {
-                    body.extend(build_edges(info));
-                }
-                write!(f, "\n\n{}", card(&blue(target_login), &body))?;
-            }
-        } else if self.total <= 1 && self.paths.len() == 1 {
-            // Exact, single path.
-            let info = &self.paths[0];
-            let chain = build_path_chain(info);
-            let steps = dim(&format!("{} 步", info.path.len().saturating_sub(1)));
 
-            if info.path.len() > 2 && !info.directed_edges.is_empty() {
-                let head = format!("{chain}  {steps}");
-                let body = build_edges(info);
-                write!(
-                    f,
-                    "{}",
-                    header(
-                        "🗺️",
-                        &format!("{} 到 {}", dim(&self.from), bold(&self.query)),
-                        ""
-                    )
-                )?;
-                write!(f, "\n\n{}", card(&head, &body))?;
-            } else {
-                write!(
-                    f,
-                    "{}",
-                    header(
-                        "🗺️",
-                        &format!("{} 到 {}", dim(&self.from), bold(&self.query)),
-                        &format!("{chain}  {steps}")
-                    )
-                )?;
+                let edge_nodes: Vec<TreeNode> = if info.path.len() > 2 {
+                    info.directed_edges
+                        .iter()
+                        .map(|e| TreeNode::leaf(directed_edge(&e.from, &e.to)))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
+                let body = if !edge_nodes.is_empty() {
+                    vec![TreeNode::with_children(
+                        format!("{chain}  {steps}"),
+                        edge_nodes,
+                    )]
+                } else {
+                    vec![TreeNode::leaf(format!("{chain}  {steps}"))]
+                };
+
+                if pi > 0 {
+                    write!(f, "\n\n")?;
+                } else {
+                    write!(f, "\n")?;
+                }
+                write!(f, "{}", tree(&blue(target_login), &body))?;
             }
         } else {
-            // Exact, multiple paths.
-            let meta = if self.total > self.paths.len() {
-                format!("共 {} 条路径，显示前 {} 条", self.total, self.paths.len())
-            } else {
-                format!("共 {} 条路径", self.total)
-            };
-            write!(
+            // Exact match.
+            writeln!(
                 f,
                 "{}",
                 header(
                     "🗺️",
-                    &format!("{} 到 {}", dim(&self.from), bold(&self.query)),
+                    &format!("{} 到 {}", bold(&self.from), target(&self.query)),
                     &meta
                 )
             )?;
 
-            for info in &self.paths {
+            for (pi, info) in self.paths.iter().enumerate() {
                 let chain = build_path_chain(info);
                 let steps = dim(&format!("{} 步", info.path.len().saturating_sub(1)));
+
+                let edge_nodes: Vec<TreeNode> = if info.path.len() > 2 {
+                    info.directed_edges
+                        .iter()
+                        .map(|e| TreeNode::leaf(directed_edge(&e.from, &e.to)))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
                 let head = format!("{chain}  {steps}");
-                let body = build_edges(info);
-                write!(f, "\n\n{}", card(&head, &body))?;
+
+                if pi > 0 {
+                    write!(f, "\n\n")?;
+                } else {
+                    write!(f, "\n")?;
+                }
+                write!(f, "{}", tree(&head, &edge_nodes))?;
             }
         }
         Ok(())
@@ -535,7 +531,7 @@ impl fmt::Display for RouteResult {
 
 impl fmt::Display for CommonResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
+        writeln!(
             f,
             "{}",
             header(
@@ -545,11 +541,19 @@ impl fmt::Display for CommonResult {
             )
         )?;
 
-        for (label, list) in [
+        for (pi, (label, list)) in [
             ("共同关注", &self.common_following),
             ("共同粉丝", &self.common_followers),
-        ] {
-            write!(f, "\n\n{}", tree_title_list(label, list))?;
+        ]
+        .iter()
+        .enumerate()
+        {
+            if pi > 0 {
+                write!(f, "\n\n")?;
+            } else {
+                write!(f, "\n")?;
+            }
+            write!(f, "{}", tree_title_list(label, list))?;
         }
 
         Ok(())
@@ -569,51 +573,63 @@ impl fmt::Display for UserView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let d = self.data;
 
-        write!(f, "{}", header("👤", &blue(&d.login), ""))?;
+        writeln!(f, "{}", header("👤", &blue(&d.login), ""))?;
 
         // ── Basic info ──
         let na = dim("—");
         let profile_items = [
-            TreeItem::new("姓名", d.name.as_deref().unwrap_or(&na)),
-            TreeItem::new("公司", d.company.as_deref().unwrap_or(&na)),
-            TreeItem::new("所在地", d.location.as_deref().unwrap_or(&na)),
-            TreeItem::new(
-                "账号创建",
+            TreeNode::leaf(format!("姓名      {}", d.name.as_deref().unwrap_or(&na))),
+            TreeNode::leaf(format!("公司      {}", d.company.as_deref().unwrap_or(&na))),
+            TreeNode::leaf(format!(
+                "所在地    {}",
+                d.location.as_deref().unwrap_or(&na)
+            )),
+            TreeNode::leaf(format!(
+                "账号创建  {}",
                 d.created_at
                     .as_ref()
                     .map(|s| &s[..s.len().min(10)])
-                    .unwrap_or(&na),
-            ),
+                    .unwrap_or(&na)
+            )),
         ];
-        write!(f, "\n\n{}", tree_block("基本信息", &profile_items))?;
+        write!(f, "\n{}", tree(&bold("基本信息"), &profile_items))?;
 
-        // ── Stats ──
-        let f_num = |n: Option<i64>| n.map(|v| num(v as u64)).unwrap_or_else(|| dim("—"));
-        let stat_items = [
-            TreeItem::new(
-                "关注",
-                format!(
-                    "{} 人  {}",
-                    f_num(d.following_count),
-                    dim(&format!("已获取 {} 人", d.crawled_following))
-                ),
-            ),
-            TreeItem::new(
-                "粉丝",
-                format!(
-                    "{} 人  {}",
-                    f_num(d.followers_count),
-                    dim(&format!("已获取 {} 人", d.crawled_followers))
-                ),
-            ),
-            TreeItem::new("公开仓库", format!("{} 个", f_num(d.public_repos))),
+        // ── Stats (right‑aligned counts) ──
+        let f_val = |n: Option<i64>, unit: &str| -> String {
+            n.map(|v| format!("{} {}", num(v as u64), unit))
+                .unwrap_or_else(|| na.clone())
+        };
+        let follow_val = f_val(d.following_count, "人");
+        let follower_val = f_val(d.followers_count, "人");
+        let repo_val = f_val(d.public_repos, "个");
+
+        let max_w = [&follow_val, &follower_val, &repo_val]
+            .iter()
+            .map(|s| visible_width(s))
+            .max()
+            .unwrap_or(0);
+
+        let stat_nodes = vec![
+            TreeNode::leaf(format!(
+                "关注      {:>w$}  {}",
+                follow_val,
+                dim(&format!("已获取 {} 人", d.crawled_following)),
+                w = max_w
+            )),
+            TreeNode::leaf(format!(
+                "粉丝      {:>w$}  {}",
+                follower_val,
+                dim(&format!("已获取 {} 人", d.crawled_followers)),
+                w = max_w
+            )),
+            TreeNode::leaf(format!("公开仓库  {:>w$}", repo_val, w = max_w)),
         ];
-        write!(f, "\n\n{}", tree_block("统计", &stat_items))?;
+        write!(f, "\n\n{}", tree(&bold("统计"), &stat_nodes))?;
 
         // ── Social ──
         let max_names = if self.detail { usize::MAX } else { 10 };
         let groups = social_groups(d, max_names);
-        write!(f, "\n\n{}", nested_tree("社交关系", &groups))?;
+        write!(f, "\n\n{}", tree(&bold("社交关系"), &groups))?;
 
         Ok(())
     }
@@ -624,7 +640,7 @@ impl fmt::Display for UserView<'_> {
 impl fmt::Display for SuggestResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.based_on == 0 {
-            write!(
+            writeln!(
                 f,
                 "{}",
                 header(
@@ -636,19 +652,19 @@ impl fmt::Display for SuggestResult {
             return Ok(());
         }
         if self.suggestions.is_empty() {
-            write!(f, "{}", header("💡", "暂无推荐，试试先多爬些数据", ""))?;
+            writeln!(f, "{}", header("💡", "暂无推荐，试试先多爬些数据", ""))?;
             return Ok(());
         }
 
-        write!(
+        writeln!(
             f,
             "{}",
             header(
                 "💡",
                 &format!(
-                    "基于 {} 的社交圈推荐  top {}",
+                    "基于 {} 的社交圈推荐  {}",
                     blue(&self.user),
-                    self.suggestions.len()
+                    dim(&format!("top {}", self.suggestions.len()))
                 ),
                 ""
             )
@@ -660,13 +676,13 @@ impl fmt::Display for SuggestResult {
         let max_login_w = self
             .suggestions
             .iter()
-            .map(|s| UnicodeWidthStr::width(s.login.as_str()))
+            .map(|s| visible_width(s.login.as_str()))
             .max()
             .unwrap_or(0);
 
-        for s in &self.suggestions {
+        for (si, s) in self.suggestions.iter().enumerate() {
             let bar = weight_bar(s.weight, max_weight, 7);
-            let login_w = UnicodeWidthStr::width(s.login.as_str());
+            let login_w = visible_width(s.login.as_str());
             let login_pad = max_login_w.saturating_sub(login_w);
             let head = format!(
                 "{}{}  {bar}  {:.2}",
@@ -676,14 +692,20 @@ impl fmt::Display for SuggestResult {
             );
 
             let friends_line = if s.mutual_friends.is_empty() {
-                dim("无")
+                suffix("无")
             } else {
                 let truncated = truncate_list(&s.mutual_friends, 3);
-                format!("{truncated} 也关注了 ta")
+                suffix(&format!("{truncated}也关注了 ta"))
             };
-            let body = vec![friends_line];
 
-            write!(f, "\n\n{}", card(&head, &body))?;
+            let body = vec![TreeNode::leaf(friends_line)];
+
+            if si > 0 {
+                write!(f, "\n\n")?;
+            } else {
+                write!(f, "\n")?;
+            }
+            write!(f, "{}", tree(&head, &body))?;
         }
 
         write!(
@@ -705,19 +727,20 @@ impl fmt::Display for SuggestResult {
 impl fmt::Display for BridgesResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.bridges.is_empty() {
-            write!(f, "{}", header("🌉", "图中没有足够数据计算桥梁节点", ""))?;
+            writeln!(f, "{}", header("🌉", "图中没有足够数据计算桥梁节点", ""))?;
             return Ok(());
         }
 
-        write!(
+        writeln!(
             f,
             "{}",
             header(
                 "🌉",
-                &format!("桥梁节点  top {}", self.bridges.len()),
-                &format!("隐藏后连通分量从 {} 增加", self.baseline_components)
+                "桥梁节点",
+                &format!("top {}", dim(&self.bridges.len().to_string()))
             )
         )?;
+        writeln!(f, "隐藏后连通分量从 {} 增加", self.baseline_components)?;
 
         let headers = ["#", "login", "关注", "粉丝", "关键性"];
         let rows: Vec<Vec<String>> = self
@@ -727,7 +750,7 @@ impl fmt::Display for BridgesResult {
             .map(|(i, b)| {
                 let f = |n: i64| num(n as u64);
                 vec![
-                    format!("#{}", i + 1),
+                    dim(&format!("#{}", i + 1)),
                     blue(&b.login),
                     f(b.following.unwrap_or(0)),
                     f(b.followers.unwrap_or(0)),
@@ -736,7 +759,7 @@ impl fmt::Display for BridgesResult {
             })
             .collect();
 
-        write!(f, "\n\n{}", align_grid(&headers, &rows))?;
+        write!(f, "\n{}", align_grid(&headers, &rows))?;
 
         Ok(())
     }
@@ -749,16 +772,40 @@ impl fmt::Display for CommunitiesResult {
         // --user mode.
         if let Some(ref members) = self.user_members {
             let cid = self.user_community.unwrap_or(0);
-            let head = format!("#{cid}   {} 人", num(members.len() as u64));
-            let reps: Vec<String> = members.iter().take(3).cloned().collect();
-            let body = vec![format!("{} 为代表", reps.join(", "))];
-
-            let title = format!(
-                "{} 所在社区",
-                blue(self.user_login.as_deref().unwrap_or("?"))
+            let head = format!(
+                "{}  {} 人",
+                bold(&cid.to_string()),
+                num(members.len() as u64)
             );
-            write!(f, "{}", header("🏘️", &title, ""))?;
-            write!(f, "\n\n{}", card(&head, &body))?;
+            let reps = if members.is_empty() {
+                suffix("无")
+            } else {
+                format!(
+                    "{} {}",
+                    members
+                        .iter()
+                        .take(3)
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    suffix("为代表")
+                )
+            };
+            let body = vec![TreeNode::leaf(reps)];
+
+            writeln!(
+                f,
+                "{}",
+                header(
+                    "🏘️",
+                    &format!(
+                        "{} 所在社区",
+                        blue(self.user_login.as_deref().unwrap_or("?"))
+                    ),
+                    ""
+                )
+            )?;
+            write!(f, "\n{}", tree(&head, &body))?;
 
             // Full member list for grep.
             write!(f, "\n\n  同社区成员:")?;
@@ -769,34 +816,50 @@ impl fmt::Display for CommunitiesResult {
         }
 
         if self.communities.is_empty() {
-            write!(f, "{}", header("🏘️", "图中没有检测到社区", ""))?;
+            writeln!(f, "{}", header("🏘️", "图中没有检测到社区", ""))?;
             return Ok(());
         }
 
-        write!(
+        writeln!(
             f,
             "{}",
             header(
                 "🏘️",
-                &format!(
-                    "社区发现  {} 算法，模块度 Q={}",
-                    self.algorithm,
-                    modularity_color(self.modularity)
-                ),
-                &format!("共 {} 个社区", self.num_communities)
+                "社区发现",
+                &format!("共 {} 个社区", dim(&self.num_communities.to_string()))
             )
         )?;
+        writeln!(
+            f,
+            "  Louvain 算法  {}  Q = {}",
+            dim("模块度"),
+            modularity_color(self.modularity)
+        )?;
 
-        for c in &self.communities {
-            let head = format!("#{}   {} 人", c.id + 1, num(c.size as u64));
-            let body = vec![format!("{} 为代表", c.representatives.join(", "))];
-            write!(f, "\n\n{}", card(&head, &body))?;
+        for (ci, c) in self.communities.iter().enumerate() {
+            let head = format!("{}  {} 人", bold(&c.id.to_string()), num(c.size as u64));
+            let reps = if c.representatives.is_empty() {
+                suffix("无")
+            } else {
+                format!("{} {}", c.representatives.join(", "), suffix("为代表"))
+            };
+            let body = vec![TreeNode::leaf(reps)];
+
+            if ci > 0 {
+                write!(f, "\n\n")?;
+            } else {
+                write!(f, "\n")?;
+            }
+            write!(f, "{}", tree(&head, &body))?;
         }
 
         write!(
             f,
             "{}",
-            footer(&format!("仅显示前 {} 个社区", self.communities.len()))
+            footer(&format!(
+                "仅显示前 {} 个社区",
+                dim(&self.communities.len().to_string())
+            ))
         )?;
 
         Ok(())
@@ -807,15 +870,16 @@ impl fmt::Display for CommunitiesResult {
 
 impl fmt::Display for StatsResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", header("📊", "数据库概况", ""))?;
+        writeln!(f, "{}", header("📊", "gh6 数据库", ""))?;
 
+        // ── Database overview ──
         let size_str = if self.file_size_bytes > 1_000_000 {
             format!("{:.1} MB", self.file_size_bytes as f64 / 1_000_000.0)
         } else {
             format!("{} KB", self.file_size_bytes / 1000)
         };
 
-        let overview_rows = [
+        let overview_rows: &[(&str, String)] = &[
             ("用户总数", num(self.total_users)),
             ("已爬", num(self.crawled)),
             ("排队", num(self.pending)),
@@ -825,10 +889,11 @@ impl fmt::Display for StatsResult {
             ),
             ("数据库", size_str),
         ];
-        write!(f, "\n\n{}", kv_grid(&overview_rows))?;
+        let overview_nodes = kv_to_tree_nodes(overview_rows);
+        write!(f, "\n{}", tree(&bold("数据库概况"), &overview_nodes))?;
 
-        // Degree distribution.
-        write!(f, "\n\n{}", section("度数分布"))?;
+        // ── Degree distribution ──
+        write!(f, "\n\n  {}", bold("度数分布"))?;
         if self.degree_dist.is_empty() {
             write!(f, "\n  {}", dim("（无数据）"))?;
         } else {
@@ -841,9 +906,8 @@ impl fmt::Display for StatsResult {
             }
         }
 
-        // Graph stats.
-        write!(f, "\n\n{}", section("图统计"))?;
-        let graph_rows = [
+        // ── Graph stats ──
+        let graph_rows: &[(&str, String)] = &[
             ("边数", num(self.total_edges)),
             ("图密度", density_color(self.density)),
             ("连通分量数", num(self.connected_components as u64)),
@@ -856,7 +920,8 @@ impl fmt::Display for StatsResult {
             ("有出边的用户", num(self.users_with_outgoing)),
             ("有入边的用户", num(self.users_with_incoming)),
         ];
-        write!(f, "\n{}", kv_grid(&graph_rows))?;
+        let graph_nodes = kv_to_tree_nodes(graph_rows);
+        write!(f, "\n\n{}", tree(&bold("图统计"), &graph_nodes))?;
 
         Ok(())
     }
@@ -908,10 +973,9 @@ impl fmt::Display for StatusData {
 
         let uptime = fmt_uptime(self.uptime_secs);
 
-        let title = format!("⏳ gh6 · {}", dim(&uptime));
-        writeln!(f, "{title}")?;
+        writeln!(f, "{}", header("⏳", "gh6", ""))?;
 
-        let rows = [
+        let rows: &[(&str, String)] = &[
             ("服务状态", state_str),
             ("已爬", num(self.users_crawled)),
             ("重试", num(self.users_retry)),
@@ -923,7 +987,8 @@ impl fmt::Display for StatusData {
             ("下次重置", reset_str),
             ("运行时间", uptime),
         ];
-        write!(f, "{}", kv_grid(&rows))?;
+        let nodes = kv_to_tree_nodes(rows);
+        write!(f, "\n{}", tree(&bold("状态"), &nodes))?;
 
         Ok(())
     }
@@ -931,39 +996,32 @@ impl fmt::Display for StatusData {
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-/// Simple KV grid (no headers) — used by stats and status.
-fn kv_grid(items: &[(&str, String)]) -> String {
+/// Build KV tree nodes from key‑value pairs.
+fn kv_to_tree_nodes(items: &[(&str, String)]) -> Vec<TreeNode> {
     let max_key_w = items
         .iter()
-        .map(|(k, _)| UnicodeWidthStr::width(*k))
+        .map(|(k, _)| visible_width(k))
         .max()
         .unwrap_or(0);
 
-    let mut s = String::new();
-    for (i, (k, v)) in items.iter().enumerate() {
-        if i > 0 {
-            s.push('\n');
-        }
-        let kw = UnicodeWidthStr::width(*k);
-        let pad = max_key_w.saturating_sub(kw);
-        s.push_str(&format!("  {k}{}  {v}", " ".repeat(pad)));
-    }
-    s
+    items
+        .iter()
+        .map(|(k, v)| {
+            let kw = visible_width(k);
+            let pad = max_key_w.saturating_sub(kw);
+            TreeNode::leaf(format!("{k}{}  {v}", " ".repeat(pad)))
+        })
+        .collect()
 }
 
 /// Render a titled tree list (used by common view).
 fn tree_title_list(label: &str, list: &[String]) -> String {
-    let title = format!("{label} {} 人", list.len());
+    let title = format!("{} {} 人", dim(label), list.len());
     if list.is_empty() {
-        return format!("  {title}\n  └ {}", dim("无"));
+        return tree(&title, &[TreeNode::leaf(dim("无"))]);
     }
-    let mut s = format!("  {title}");
-    for (i, item) in list.iter().enumerate() {
-        s.push('\n');
-        let prefix = if i == list.len() - 1 { "└ " } else { "├ " };
-        s.push_str(&format!("  {prefix}{item}"));
-    }
-    s
+    let items: Vec<TreeNode> = list.iter().map(|s| TreeNode::leaf(s.clone())).collect();
+    tree(&title, &items)
 }
 
 /// Build a styled path chain from a `PathInfo`.
@@ -972,16 +1030,8 @@ fn build_path_chain(info: &PathInfo) -> String {
     path_chain(&logins)
 }
 
-/// Build directed‑edge lines from a `PathInfo`.
-fn build_edges(info: &PathInfo) -> Vec<String> {
-    info.directed_edges
-        .iter()
-        .map(|e| directed_edge(&e.from, &e.to))
-        .collect()
-}
-
 /// Build social‑section tree groups for user view.
-fn social_groups(data: &UserProfileResult, max_names: usize) -> Vec<TreeGroup> {
+fn social_groups(data: &UserProfileResult, max_names: usize) -> Vec<TreeNode> {
     let following_set: std::collections::HashSet<&str> =
         data.following.iter().map(|s| s.as_str()).collect();
     let mutual_set: std::collections::HashSet<&str> =
@@ -1004,33 +1054,36 @@ fn social_groups(data: &UserProfileResult, max_names: usize) -> Vec<TreeGroup> {
 
     if !following_only.is_empty() || !data.mutual.is_empty() || !followers_only.is_empty() {
         if !following_only.is_empty() {
-            let label = format!("{} 关注 {} 人", green("→"), following_only.len());
-            let items = truncate_list_items(&following_only, max_names);
-            groups.push(TreeGroup { label, items });
+            let label = format!(
+                "{} {} {}",
+                green("→"),
+                bold("关注"),
+                dim(&format!("{} 人", following_only.len()))
+            );
+            let items = list_to_leaves(&following_only, max_names);
+            groups.push(TreeNode::with_children(label, items));
         }
         if !data.mutual.is_empty() {
-            let label = format!("{} 互关 {} 人", yellow("⇄"), data.mutual.len());
-            let items = truncate_list_items(&data.mutual, max_names);
-            groups.push(TreeGroup { label, items });
+            let label = format!(
+                "{} {} {}",
+                yellow("⇄"),
+                bold("互关"),
+                dim(&format!("{} 人", data.mutual.len()))
+            );
+            let items = list_to_leaves(&data.mutual, max_names);
+            groups.push(TreeNode::with_children(label, items));
         }
         if !followers_only.is_empty() {
-            let label = format!("{} 粉丝 {} 人", cyan("←"), followers_only.len());
-            let items = truncate_list_items(&followers_only, max_names);
-            groups.push(TreeGroup { label, items });
+            let label = format!(
+                "{} {} {}",
+                cyan("←"),
+                bold("粉丝"),
+                dim(&format!("{} 人", followers_only.len()))
+            );
+            let items = list_to_leaves(&followers_only, max_names);
+            groups.push(TreeNode::with_children(label, items));
         }
     }
 
     groups
-}
-
-/// Split a list into display items for truncate_list.
-fn truncate_list_items(items: &[String], max: usize) -> Vec<String> {
-    if items.len() <= max {
-        items.to_vec()
-    } else {
-        let mut out: Vec<String> = items.iter().take(max).cloned().collect();
-        let remaining = items.len() - max;
-        out.push(format!("等 {} 人", remaining));
-        out
-    }
 }
