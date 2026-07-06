@@ -2,17 +2,6 @@
 //!
 //! This module operates on the SQLite database directly via [`Db`].
 //! It does **not** depend on the crawl server being alive.
-//!
-//! # Required additions to `crate::db::Db`
-//!
-//! For `cmd_neighbors` and `cmd_export` the following methods are needed
-//! on [`Db`] (trivial `SELECT` wrappers — see bottom of this file):
-//!
-//! ```ignore
-//! pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>, DbError>
-//! pub fn get_all_users(&self) -> Result<Vec<User>, DbError>
-//! pub fn get_all_edges(&self) -> Result<Vec<Edge>, DbError>
-//! ```
 
 use std::error::Error;
 use std::fs;
@@ -39,6 +28,8 @@ pub struct CommonResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserProfileResult {
     pub login: String,
+    /// Whether the full profile was fetched (row in `user_profiles`).
+    pub profile_crawled: bool,
     pub name: Option<String>,
     pub company: Option<String>,
     pub location: Option<String>,
@@ -49,6 +40,21 @@ pub struct UserProfileResult {
     pub following: Vec<String>,
     pub mutual: Vec<String>,
     pub followers: Vec<String>,
+    /// Number of following relationships actually present in `edges`.
+    pub crawled_following: usize,
+    /// Number of follower relationships actually present in `edges`.
+    pub crawled_followers: usize,
+}
+
+/// Unified route result for `analyze route`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RouteResult {
+    pub from: String,
+    pub query: String,
+    pub is_fuzzy: bool,
+    /// Total paths found (may be more than `paths.len()` due to `--limit`).
+    pub total: usize,
+    pub paths: Vec<PathInfo>,
 }
 
 /// A suggestion for `analyze suggest`.
@@ -104,6 +110,9 @@ pub struct CommunitiesResult {
     pub user_community: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_members: Option<Vec<String>>,
+    /// The login that was queried (for `--user` display).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_login: Option<String>,
 }
 
 /// A directed follows edge between two users.
@@ -141,7 +150,79 @@ pub struct StatsResult {
 }
 
 // ---------------------------------------------------------------------------
-// cmd_path
+// cmd_route
+// ---------------------------------------------------------------------------
+
+/// Unified route command: shortest path, all paths, or fuzzy search.
+///
+/// * `limit = 1` — shortest path only
+/// * `limit > 1` — up to `limit` paths (0 = unlimited)
+/// * `fuzzy = true` — search for users matching `query` (limit applies)
+pub fn cmd_route(
+    db: &Db,
+    from: &str,
+    query: &str,
+    limit: usize,
+    fuzzy: bool,
+) -> Result<RouteResult, Box<dyn Error>> {
+    if fuzzy {
+        let matches = db.search_users(query)?;
+        let mut paths = Vec::new();
+        for user in &matches {
+            if let Some(info) = cmd_path(db, from, &user.login)? {
+                paths.push(info);
+            }
+        }
+        let total = paths.len();
+        if limit > 0 && paths.len() > limit {
+            paths.truncate(limit);
+        }
+        Ok(RouteResult {
+            from: from.to_string(),
+            query: query.to_string(),
+            is_fuzzy: true,
+            total,
+            paths,
+        })
+    } else if limit == 1 {
+        let info = cmd_path(db, from, query)?;
+        match info {
+            Some(info) => Ok(RouteResult {
+                from: from.to_string(),
+                query: query.to_string(),
+                is_fuzzy: false,
+                total: 1,
+                paths: vec![info],
+            }),
+            None => Ok(RouteResult {
+                from: from.to_string(),
+                query: query.to_string(),
+                is_fuzzy: false,
+                total: 0,
+                paths: vec![],
+            }),
+        }
+    } else {
+        let max = if limit == 0 { usize::MAX } else { limit };
+        let all_paths = cmd_all_paths(db, from, query, max)?;
+        let total = all_paths.len();
+        let paths = if limit > 0 && all_paths.len() > limit {
+            all_paths.into_iter().take(limit).collect()
+        } else {
+            all_paths
+        };
+        Ok(RouteResult {
+            from: from.to_string(),
+            query: query.to_string(),
+            is_fuzzy: false,
+            total,
+            paths,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cmd_path (internal)
 // ---------------------------------------------------------------------------
 
 /// Find the shortest path between `from` and `to` through the social graph.
@@ -307,10 +388,16 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
         .get_user_by_login(login)?
         .ok_or_else(|| format!("user not found: {login}"))?;
 
+    let profile_crawled = db.has_profile(user.id)?;
+
     let edges = db.get_edges_by_user(user.id)?;
 
     let mut following = Vec::new();
     let mut followers = Vec::new();
+
+    // Count actual edges present for crawled counts.
+    let mut crawled_following = 0usize;
+    let mut crawled_followers = 0usize;
 
     for edge in &edges {
         if edge.edge_type != "follows" {
@@ -321,10 +408,12 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
             if let Some(other) = db.get_user_by_id(edge.to_user_id)? {
                 following.push(other.login);
             }
+            crawled_following += 1;
         } else if edge.to_user_id == user.id
             && let Some(other) = db.get_user_by_id(edge.from_user_id)?
         {
             followers.push(other.login);
+            crawled_followers += 1;
         }
     }
 
@@ -342,6 +431,7 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
 
     Ok(UserProfileResult {
         login: user.login,
+        profile_crawled,
         name: user.name,
         company: user.company,
         location: user.location,
@@ -352,6 +442,8 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
         following,
         mutual,
         followers,
+        crawled_following,
+        crawled_followers,
     })
 }
 
@@ -879,6 +971,7 @@ pub fn cmd_communities(
         communities: comm_list,
         user_community,
         user_members,
+        user_login: user.map(|s| s.to_string()),
     })
 }
 
