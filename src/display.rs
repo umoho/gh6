@@ -484,7 +484,7 @@ impl fmt::Display for RouteResult {
                 if pi > 0 {
                     write!(f, "\n\n")?;
                 } else {
-                    write!(f, "\n")?;
+                    writeln!(f)?;
                 }
                 write!(f, "{}", tree(&blue(target_login), &body))?;
             }
@@ -518,7 +518,7 @@ impl fmt::Display for RouteResult {
                 if pi > 0 {
                     write!(f, "\n\n")?;
                 } else {
-                    write!(f, "\n")?;
+                    writeln!(f)?;
                 }
                 write!(f, "{}", tree(&head, &edge_nodes))?;
             }
@@ -551,7 +551,7 @@ impl fmt::Display for CommonResult {
             if pi > 0 {
                 write!(f, "\n\n")?;
             } else {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
             write!(f, "{}", tree_title_list(label, list))?;
         }
@@ -732,7 +732,7 @@ impl fmt::Display for SuggestResult {
             if si > 0 {
                 write!(f, "\n\n")?;
             } else {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
             write!(f, "{}", tree(&head, &body))?;
         }
@@ -766,7 +766,7 @@ impl fmt::Display for BridgesResult {
             header(
                 "🌉",
                 "桥梁节点",
-                &format!("{}", dim(&format!("top {}", self.bridges.len())))
+                &dim(&format!("top {}", self.bridges.len())).to_string()
             )
         )?;
         writeln!(f, "\n隐藏后连通分量从 {} 增加", self.baseline_components)?;
@@ -879,7 +879,7 @@ impl fmt::Display for CommunitiesResult {
             if ci > 0 {
                 write!(f, "\n\n")?;
             } else {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
             write!(f, "{}", tree(&head, &body))?;
         }

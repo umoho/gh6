@@ -47,6 +47,12 @@ pub trait Crawler: Send + Sync {
 /// Stateless crawler that follows `following` edges (BFS layer by layer).
 pub struct FollowCrawler;
 
+impl Default for FollowCrawler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FollowCrawler {
     pub fn new() -> Self {
         Self
