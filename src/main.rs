@@ -4,11 +4,11 @@ use clap::{Parser, Subcommand};
 use owo_colors::OwoColorize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use unicode_width::UnicodeWidthStr;
+mod tui;
 
 use gh6::analyze;
 use gh6::db::Db;
-use gh6::display::{self, UserView};
+use gh6::display::UserView;
 use gh6::types::*;
 
 // ── CLI Definition ───────────────────────────────────────────────────────────
@@ -31,15 +31,10 @@ enum Command {
     /// Pause the crawl (daemon stays alive)
     Pause,
 
-    /// Show crawl progress or watch real-time updates
+    /// Show crawl progress or live TUI monitor
     Status {
-        /// Watch for real-time events (keeps connection open)
-        #[arg(long)]
-        watch: bool,
-
-        /// Show a live status bar at the bottom (only with --watch)
-        #[arg(long)]
-        progress: bool,
+        #[command(subcommand)]
+        sub: Option<StatusCommand>,
     },
 
     /// Analyze the collected social graph
@@ -47,6 +42,12 @@ enum Command {
         #[command(subcommand)]
         sub: AnalyzeCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum StatusCommand {
+    /// Interactive real-time crawl monitor (TUI)
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -146,173 +147,6 @@ async fn send_socket_command(
     Ok(serde_json::from_str(raw.trim())?)
 }
 
-async fn watch_socket(
-    cmd: &serde_json::Value,
-    json: bool,
-    progress: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = socket_path();
-    let mut stream = UnixStream::connect(&path)
-        .await
-        .map_err(|_| NOT_RUNNING_MSG)?;
-
-    let mut line = serde_json::to_string(cmd)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
-
-    let mut reader = BufReader::new(&mut stream);
-    let mut buffer = String::new();
-    let mut has_progress = false;
-
-    let mut current_status: Option<StatusData> = None;
-
-    loop {
-        buffer.clear();
-        match reader.read_line(&mut buffer).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = buffer.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<ServerResponse>(trimmed) {
-                    Ok(resp) => {
-                        if json {
-                            println!("{}", serde_json::to_string(&resp)?);
-                        } else {
-                            if let ServerResponse::Ok { data: Some(data) } = &resp
-                                && let Ok(s) = serde_json::from_value::<StatusData>(data.clone())
-                            {
-                                current_status = Some(s);
-                            }
-
-                            if progress && has_progress {
-                                eprint!("\x1b[1F\x1b[2K");
-                            }
-
-                            print_event(&resp);
-
-                            if progress && let Some(ref s) = current_status {
-                                let p = progress_line(s);
-                                eprint!("{p}");
-                                has_progress = true;
-                            }
-                        }
-                        if matches!(resp, ServerResponse::Bye) {
-                            break;
-                        }
-                    }
-                    Err(e) => eprintln!("{}  parse error: {e}", "⚠".yellow()),
-                }
-            }
-            Err(e) => {
-                eprintln!("{}  connection error: {e}", "⚠".yellow());
-                break;
-            }
-        }
-    }
-
-    if has_progress {
-        eprintln!();
-    }
-
-    Ok(())
-}
-
-fn progress_line(s: &StatusData) -> String {
-    if s.paused {
-        return format!(
-            "{} queue {}  waiting for 'gh6 run' …\n",
-            "⏸".yellow(),
-            display::num(s.users_queued).dimmed()
-        );
-    }
-    let cc = s.currently_crawling.as_deref().unwrap_or("-");
-    let api_val = format!(
-        "{}/{}",
-        display::num(s.api_remaining as u64),
-        display::num(s.api_limit as u64)
-    );
-
-    let deg = format!("{}°", s.current_degree);
-    let left_plain = format!(
-        "crawled {}  queue {}  retry {}  error {}  {}  crawling {}",
-        display::num(s.users_crawled),
-        display::num(s.users_queued),
-        display::num(s.users_retry),
-        display::num(s.users_error),
-        deg,
-        cc,
-    );
-    let right_plain = format!("up {}  API {}", display::fmt_uptime(s.uptime_secs), api_val,);
-
-    let left_w = left_plain.width();
-    let right_w = right_plain.width();
-    let term_w = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(80) as usize;
-    let pad = term_w.saturating_sub(left_w + right_w).max(1);
-
-    let api_colored = if s.api_remaining >= 1000 {
-        api_val.green().to_string()
-    } else if s.api_remaining >= 100 {
-        api_val.yellow().to_string()
-    } else {
-        api_val.red().to_string()
-    };
-
-    let left = format!(
-        "{} {}  {} {}  {} {}  {} {}  {}  {} {}",
-        "crawled".dimmed(),
-        display::num(s.users_crawled).green(),
-        "queue".dimmed(),
-        display::num(s.users_queued).dimmed(),
-        "retry".dimmed(),
-        display::num(s.users_retry).yellow(),
-        "error".dimmed(),
-        display::num(s.users_error).red(),
-        deg.cyan(),
-        "crawling".dimmed(),
-        cc.blue(),
-    );
-
-    let right = format!(
-        "{} {}  {} {}",
-        "up".dimmed(),
-        display::fmt_uptime(s.uptime_secs).dimmed(),
-        "API".dimmed(),
-        api_colored,
-    );
-
-    format!("{left}{}{right}\n", " ".repeat(pad))
-}
-
-fn print_event(resp: &ServerResponse) {
-    match resp {
-        ServerResponse::Event { data } => match data {
-            CrawlEvent::UserDone {
-                login,
-                degree,
-                new_connections,
-            } => {
-                let tag = format!("[{degree}°]").cyan().to_string();
-                let done = "done".green().to_string();
-                println!("{tag} {login}  {done}  +{new_connections} connections");
-            }
-            CrawlEvent::UserQueued { login, degree } => {
-                let tag = format!("[{degree}°]").dimmed().to_string();
-                let q = "queued".dimmed().to_string();
-                println!("{tag} {login}  {q}");
-            }
-        },
-        ServerResponse::Bye => {
-            println!("{}", "👋 server shutting down".yellow());
-        }
-        _ => {}
-    }
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -370,11 +204,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Command::Status { watch, progress } => {
-            if watch {
-                let cmd = serde_json::json!({"cmd": "status", "watch": true});
-                watch_socket(&cmd, cli.json, progress).await?;
-            } else {
+        Command::Status { sub } => match sub {
+            Some(StatusCommand::Tui) => {
+                if cli.json {
+                    eprintln!("{} --json is not supported with 'status tui'", "✗".red());
+                    std::process::exit(1);
+                }
+                tui::run(socket_path()).await?;
+            }
+            None => {
                 let cmd = serde_json::json!({"cmd": "status"});
                 match send_socket_command(&cmd).await {
                     Ok(ServerResponse::Ok { data: Some(data) }) => {
@@ -402,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-        }
+        },
 
         Command::Analyze { sub } => {
             let db = Db::open()?;

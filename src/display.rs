@@ -619,13 +619,21 @@ impl fmt::Display for UserView<'_> {
             TreeNode::leaf(format!(
                 "关注      {:>w$}  {}",
                 follow_val,
-                dim(&format!("已获取 {:>cw$} 人", d.crawled_following, cw = max_crawled_w)),
+                dim(&format!(
+                    "已获取 {:>cw$} 人",
+                    d.crawled_following,
+                    cw = max_crawled_w
+                )),
                 w = max_w
             )),
             TreeNode::leaf(format!(
                 "粉丝      {:>w$}  {}",
                 follower_val,
-                dim(&format!("已获取 {:>cw$} 人", d.crawled_followers, cw = max_crawled_w)),
+                dim(&format!(
+                    "已获取 {:>cw$} 人",
+                    d.crawled_followers,
+                    cw = max_crawled_w
+                )),
                 w = max_w
             )),
             TreeNode::leaf(format!("公开仓库  {:>w$}", repo_val, w = max_w)),
@@ -761,11 +769,7 @@ impl fmt::Display for BridgesResult {
                 &format!("{}", dim(&format!("top {}", self.bridges.len())))
             )
         )?;
-        writeln!(
-            f,
-            "\n隐藏后连通分量从 {} 增加",
-            self.baseline_components
-        )?;
+        writeln!(f, "\n隐藏后连通分量从 {} 增加", self.baseline_components)?;
 
         let headers = ["#", "Login", "关注", "粉丝", "关键性"];
         let rows: Vec<Vec<String>> = self
@@ -833,10 +837,8 @@ impl fmt::Display for CommunitiesResult {
             write!(f, "\n{}", tree(&head, &body))?;
 
             // Full member list for grep.
-            let member_nodes: Vec<TreeNode> = members
-                .iter()
-                .map(|m| TreeNode::leaf(m.clone()))
-                .collect();
+            let member_nodes: Vec<TreeNode> =
+                members.iter().map(|m| TreeNode::leaf(m.clone())).collect();
             write!(f, "\n\n{}", tree(&bold("同社区成员"), &member_nodes))?;
             return Ok(());
         }
@@ -862,7 +864,11 @@ impl fmt::Display for CommunitiesResult {
         )?;
 
         for (ci, c) in self.communities.iter().enumerate() {
-            let head = format!("{}  {} 人", bold(&format!("社区 {}", c.id)), num(c.size as u64));
+            let head = format!(
+                "{}  {} 人",
+                bold(&format!("社区 {}", c.id)),
+                num(c.size as u64)
+            );
             let reps = if c.representatives.is_empty() {
                 suffix("无")
             } else {
