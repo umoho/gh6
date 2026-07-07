@@ -32,7 +32,8 @@
 gh6d                             启动守护进程（由 launchd / systemd 管理，无需手动调用）
 gh6 run                          开始 / 恢复爬取
 gh6 pause                        暂停爬取（守护进程保持运行）
-gh6 status [--watch]             查看进度 / 实时监控
+gh6 status                        查看进度（一次性查询）
+gh6 status tui                    实时监控（TUI 全屏界面）
 
 gh6 analyze route <LOGIN>        查询从种子用户到目标用户的最短路径
              [--from <LOGIN>]    指定起点（默认读取 config seed）
@@ -62,7 +63,8 @@ gh6 analyze export <FILE>           导出图到 JSON 文件
 
 - `status` / `run` / `pause` 通过 Unix socket 与守护进程通信
 - `analyze` / `export` 直接读取 SQLite，不依赖守护进程
-- 所有子命令支持 `--json` 输出 JSON
+- 所有子命令（除 `status tui` 外）支持 `--json` 输出 JSON
+- `status tui` 为全屏交互界面，不支持 `--json`
 
 ### 服务管理
 
@@ -639,7 +641,7 @@ pub fn tree(root: &str, items: &[TreeNode]) -> String;
 - KV 对放在 `tree` 内，标题 bold
 - 度数分布独立（bar 图表不适合 tree）
 
-#### status
+#### status（一次性查询）
 
 ```text
 ⏳ gh6
@@ -653,6 +655,89 @@ pub fn tree(root: &str, items: &[TreeNode]) -> String;
 
 - 去掉 header 上的 uptime（下面已显示）
 - KV 对用 `tree` 收拢
+- 实时监控场景使用 `gh6 status tui`（见下方 TUI 章节）
+
+## TUI — gh6 status tui
+
+`gh6 status tui` 使用 ratatui + crossterm 提供全屏交互式实时监控界面，
+替代旧版 `gh6 status --watch --progress` 的手工 ANSI 方案。
+
+### 设计原则
+
+- **UI 库**：ratatui + crossterm，接管终端全屏（alternate screen + raw mode）
+- **只负责 `status tui`**：analyze 等其他命令继续走 Display Kit，互不干扰
+- **数据类型不变**：读取的 `StatusData` / `CrawlEvent` 与 daemon 端协议一致
+- **事件缓冲**：`VecDeque<String>` 环形缓冲，上限 9999 条，超出自动丢弃
+
+### 布局
+
+```
+┌──────────────────────────────────────────────┐
+│  [1°] alice                        done  +5  │  ← 事件日志区
+│  [2°] bob                         queued     │     可滚动查看
+│  [3°] some-very-long-login        done  +12  │     最多缓存 9999 条
+│  ...                                         │
+├──────────────────────────────────────────────┤
+│  crawling  alice (1°)  bob (2°)  ...         │  ← 活跃 worker 行
+│  crawled 1,234  queue 56  retry 3  API 4,567 │  ← 统计 + API 状态行
+└──────────────────────────────────────────────┘
+```
+
+- **上区**：事件日志，login 居左、状态（done/queued）居右，`ratatui::widgets::Paragraph`
+- **下区**：固定两行状态栏。第一行列出所有活跃 worker，第二行全局统计 + API 状态
+- API 剩余按阈值着色：≥1000 绿、≥100 黄、<100 红
+- 暂停时状态栏显示不同内容（⏸ 队列 N，等待 `gh6 run`）
+
+### 事件格式
+
+```text
+[1°] alice                                    done  +5 connections
+[2°] bob-two-million-very-long-login          queued
+```
+
+- `[N°]` 度数用 cyan，login 用 blue
+- 右侧状态：`done` 绿 + 连接数，`queued` dim
+- 左右对齐用 ratatui `Line` + `Alignment::SpaceBetween`
+
+### 键盘快捷键
+
+| 键 | 功能 |
+|----|------|
+| `q` / `Esc` / `Ctrl+C` | 退出 TUI，断开 socket，清理终端 |
+| `↑` / `↓` / `j` / `k` | 滚动事件日志 |
+| `PgUp` / `PgDn` | 翻页 |
+| `g` / `G` | 跳到顶 / 跳到底 |
+| `r` | 强制重绘（终端 resize 时自动处理，一般不需要） |
+
+### 数据流
+
+```
+gh6d (daemon)                     gh6 status tui
+    │                                    │
+    ├── {"type":"ok","data":{...}} ────→ │  初始状态快照
+    ├── {"type":"event","data":{...}} ──→ │  UserDone / UserQueued
+    ├── {"type":"ok","data":{...}} ────→ │  定期状态快照（更新状态栏）
+    │       ...                           │
+    │       (客户端按 q / Ctrl+C)         │  断开 socket，退出 TUI
+```
+
+- socket 读取走 tokio::sync::mpsc channel，推入主循环
+- 主循环 `tokio::select!` 同时等 channel、终端输入（crossterm EventStream）、定时重绘（250ms tick）
+
+### 与 --json 的关系
+
+`gh6 status tui --json` 在 clap 层面报错（`--json` 标记为与 `tui` 子命令冲突）。
+TUI 是全屏交互模式，JSON 输出无意义。
+
+### 调试
+
+TUI 接管终端后 `println!` 输出不可见。调试方式：
+
+| 方式 | 说明 |
+|------|------|
+| 日志文件 | `env_logger` 写入 `/tmp/gh6-tui.log`，另一终端 `tail -f` |
+| 独立 tmux socket | `tmux -L gh6-tui` 创建隔离 session，`capture-pane -p` 抓取内容 |
+| ratatui TestBackend | 单元测试中渲染到内存 buffer 验证布局 |
 
 ### 样式约定
 
@@ -671,4 +756,5 @@ pub fn tree(root: &str, items: &[TreeNode]) -> String;
 - **序列化**：serde + serde_json
 - **GitHub API**：gh CLI token（环境变量 `GITHUB_TOKEN` 或 `gh auth token`）
 - **CLI**：clap
+- **TUI**：ratatui + crossterm（用于 `gh6 status tui`）
 - **安装方式**：`cargo install`
