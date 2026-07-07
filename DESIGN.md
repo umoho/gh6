@@ -348,33 +348,54 @@ CREATE TABLE config (
 
 ## 爬虫核心
 
-### 爬取策略：分层推进
+### 爬取策略：统一调度
 
-纯 BFS 的问题：浅层没爬完，深层永久冻结；中枢用户（`following > 5000`）拖慢队列。
-因此采用三层混合策略：
+纯 BFS 的问题：浅层没爬完，深层永久冻结；大 V 用户（`following > 5000`）拖慢队列。
+原来的三层混合策略（degree ≤ 1 不跳过大 V、degree 2 中枢延后、degree ≥ 3 随机采样）
+在遇到直连大 V 时仍会产生大量 scope 塞满队列。
 
-| 度 | 策略 | 中枢处理 | 目的 |
-|----|------|---------|------|
-| 0–1 | 严格 BFS，全部照爬 | 不跳过 | 自己和直接朋友，圈子小，全量不贵 |
-| 2 | BFS，中枢延后 | `following > 5000` → `priority = low`，日常只取 `normal`，队列空时才取 `low` | 朋友的朋友，大 V 往后排 |
-| 3+ | 随机采样 | 不管中枢，随机抽就完事 | 深层保证推进，不会永远卡死 |
+因此改为统一策略：**不再按 degree 分层，所有 scope 同一套规则。**
 
-`crawl_state` 新增 `degree` 列，`insert_pending_scope` 时直接写入，省去反查 edges 的开销：
+| 用户特征 | 处理方式 | 新 scope 的 priority |
+|----------|---------|---------------------|
+| 普通用户（following ≤ 5000） | 正常爬取 | `normal` |
+| 大 V（following > 5000） | 正常爬取（保证边数据完整） | `low`（继承自父 scope） |
 
-```sql
-ALTER TABLE crawl_state ADD COLUMN degree INTEGER;
-```
+#### 调度排序
 
-取待办时按三层分流：
+所有 pending scope 按统一规则排序，不再分流：
 
 ```
-if 度 0-1 有 pending:
-    → ORDER BY degree ASC, priority ASC      # 严格 BFS
-elif 度 2 有 pending:
-    → ORDER BY priority ASC, degree ASC     # BFS + 中枢延后
-else:
-    → 度 3+ 随机抽                           # ORDER BY RANDOM() 或伪随机
+ORDER BY priority ASC,   -- high → normal → low
+         degree ASC,     -- 同优先级内浅的优先
+         error_count ASC -- 同度内出错少的优先
 ```
+
+不再需要 RANDOM() 随机采样——大 V 的关注者设 low priority 后队列自然可控，
+不会出现 single source 撑爆队列的情况。
+
+#### 大 V 判定时机
+
+大 V 判定在 **profile 查询阶段**（每次爬取前调用 `GET /users/{login}`）进行：
+
+```
+following_count ≥ HUB_FOLLOWING_THRESHOLD（5000）
+  └── 是 → 将本 scope 的 priority 设为 low（下次不再优先爬取本人）
+          但仍正常执行 crawl_following，新 scope 也继承 low priority
+  └── 否 → 保持 normal，正常执行 crawl_following
+```
+
+#### priority 继承规则
+
+新 scope 入队时的 priority 取决于**当前被爬用户**：
+
+```
+insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" : "normal")
+```
+
+- 大 V 发现的所有用户 → `low`（不堵队列）
+- 普通人发现的所有用户 → `normal`（正常调度）
+- 已在队列中的 scope 不会被覆盖（INSERT OR IGNORE，先到先得）
 
 ### 第一阶段：FollowCrawler
 
@@ -385,21 +406,33 @@ else:
 
 ### 爬取流程
 
+每条 scope 的处理流程：
+
 ```
-1. 查询 crawl_state 中 crawler_name='follow_crawler' 且 status='pending' 的 scope（优先 low degree）
+1. claim_scope：认领一条 pending scope（按 priority ASC, degree ASC, error_count ASC 排序）
 2. 取 scope_key（user login）
-3. 如果 user_profiles 中无此用户或 fetched_at 过期，调 GET /users/{login} 获取完整 profile
+3. 调 GET /users/{login} 获取完整 profile（无论是否已缓存）
+    ├── 将 profile 写入 user_profiles（INSERT OR REPLACE）
+    └── 拿到 following_count：
+          ├── ≥ 5000 → 将本 scope 的 priority 设为 low
+          └── < 5000 → 保持 normal
 4. 调 GET /users/{login}/following 获取该用户的关注列表（摘要）
-5. 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
-6. 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1, is_active=1）
-7. 对于每个新发现用户，在 crawl_state 中创建 pending 记录（degree = 当前度+1）
-8. 将该 scope_key 标记为 done
-9. 检查 AtomicBool 是否应停止
-10. 检查速率限制，sleep 或继续下一个
+    ├── 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
+    ├── 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1, is_active=1）
+    └── 对于每个新发现用户：
+          ├── 如果尚未在 crawl_state 中：创建 pending 记录
+          │     └── priority = 如果当前用户是 ≥ 5000 的大 V 则 low，否则 normal
+          └── 如果已有 crawl_state 记录：忽略（INSERT OR IGNORE）
+5. 将该 scope_key 标记为 done
+6. 广播 CrawlEvent（UserDone + UserQueued）
+7. 检查 AtomicBool 是否应停止
+8. 检查速率限制，sleep 或继续下一个
 ```
 
-与旧流程的关键差异：`users` 表只存 login，profile 数据独立写入 `user_profiles`，
-摘要 API 返回的 `GithubUser` 不再用于 upsert profile 字段。
+关键差异：
+- **profile 查询不再有条件**——每次爬取前都调完整 API（不再是"如果 user_profiles 中无此用户或 fetched_at 过期"）。
+  profile 数据本身用于更新 `user_profiles`，其中 `following` 字段用于大 V 判定。
+- **crawl_following 不再按 degree 分层**——所有用户同一套规则，大 V 不跳过，但其新 scope 继承 low priority。
 
 ### 扩展预留
 
