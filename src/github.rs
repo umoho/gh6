@@ -27,6 +27,11 @@ pub enum GithubError {
 // ---------------------------------------------------------------------------
 
 /// Abstraction over GitHub API access. Currently implemented by [`GhClient`].
+//
+// `async_fn_in_trait` is suppressed because this trait is internal-only;
+// the concrete impls are already `Send` and we don't need to expose
+// auto-trait bounds in the public API.
+#[allow(async_fn_in_trait)]
 pub trait GithubApi: Send + Sync {
     async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError>;
     async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;

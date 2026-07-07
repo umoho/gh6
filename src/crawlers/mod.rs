@@ -23,6 +23,11 @@ pub enum CrawlerError {
 /// Every crawler explores a different dimension of the GitHub social graph.
 /// The [`name`](Crawler::name) is used as the `crawler_name` key in the
 /// `crawl_state` table, allowing multiple crawlers to coexist.
+//
+// `async_fn_in_trait` is suppressed because this trait is internal-only;
+// the concrete impls are already `Send` and we don't need to expose
+// auto-trait bounds in the public API.
+#[allow(async_fn_in_trait)]
 pub trait Crawler: Send + Sync {
     /// Unique identifier used in `crawl_state.crawler_name`.
     fn name(&self) -> &str;
