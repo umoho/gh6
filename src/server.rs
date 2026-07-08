@@ -349,17 +349,12 @@ async fn crawl_loop(
             }
         };
 
-        state.currently_crawling.write().await[worker_id] = Some(CrawlingWorker {
-            login: scope.clone(),
-            degree: 0,
-        });
-
         // ── Profile phase: resolve following_count ──
         let following_count = match resolve_following_count(&client, &db, &scope).await {
             Some(c) => c,
             None => {
-                // Profile fetch failed — scope was already reset to retry.
-                state.currently_crawling.write().await[worker_id] = None;
+                // Profile fetch failed — scope was already reset to retry. No
+                // currently_crawling entry to clear because we haven't set one yet.
                 continue;
             }
         };
