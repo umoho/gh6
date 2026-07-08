@@ -342,14 +342,66 @@ fn render_workers(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let cc = status.currently_crawling.as_deref().unwrap_or("-");
-    let deg = status.current_degree;
-    let line = Line::from(vec![
-        "crawling ".dim(),
-        Span::styled(cc.to_string(), Style::new().blue()),
-        Span::styled(format!(" ({deg}°)"), Style::new().cyan()),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    if status.currently_crawling.is_empty() {
+        f.render_widget(Paragraph::new("idle".dim()), area);
+        return;
+    }
+
+    let term_width = area.width as usize;
+    let max_show = 5;
+    let total = status.currently_crawling.len();
+    let overflow = total.saturating_sub(max_show);
+
+    // Build the full line text first so we can measure its width.
+    let mut text = String::from("crawling ");
+    for (i, w) in status.currently_crawling.iter().take(max_show).enumerate() {
+        if i > 0 {
+            text.push_str("  ");
+        }
+        text.push_str(&w.login);
+        text.push_str(&format!(" ({}°)", w.degree));
+    }
+    if overflow > 0 {
+        text.push_str(&format!("  +{overflow} more"));
+    }
+
+    if UnicodeWidthStr::width(text.as_str()) <= term_width {
+        // Fits — render with full styling.
+        let mut spans: Vec<Span<'_>> = vec![Span::styled("crawling ", Style::new().dim())];
+        for (i, w) in status.currently_crawling.iter().take(max_show).enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(w.login.clone(), Style::new().blue()));
+            spans.push(Span::styled(
+                format!(" ({}°)", w.degree),
+                Style::new().cyan(),
+            ));
+        }
+        if overflow > 0 {
+            spans.push(Span::styled(
+                format!("  +{overflow} more"),
+                Style::new().dim(),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    } else {
+        // Too wide — fall back to compact comma-separated form.
+        let logins: Vec<String> = status
+            .currently_crawling
+            .iter()
+            .take(max_show)
+            .map(|w| format!("{} ({}°)", w.login, w.degree))
+            .collect();
+        let mut compact = format!("crawling {}", logins.join(", "));
+        if overflow > 0 {
+            compact.push_str(&format!(", +{overflow} more"));
+        }
+        if UnicodeWidthStr::width(compact.as_str()) > term_width {
+            compact = display::truncate_str(&compact, term_width);
+        }
+        f.render_widget(Paragraph::new(compact.dim()), area);
+    }
 }
 
 // ── Stats line ───────────────────────────────────────────────────────────

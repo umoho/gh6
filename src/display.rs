@@ -12,7 +12,7 @@
 use std::fmt;
 
 use owo_colors::OwoColorize;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::analyze::{
     BridgesResult, CommonResult, CommunitiesResult, PathInfo, RouteResult, StatsResult,
@@ -387,6 +387,32 @@ fn list_to_leaves(items: &[String], max: usize) -> Vec<TreeNode> {
 }
 
 // ── Uptime helper ─────────────────────────────────────────────────────────
+
+/// Truncate a string to fit within `max_width` display columns,
+/// appending `…` if truncation occurred.
+pub fn truncate_str(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let suffix = "…";
+    let suffix_w = UnicodeWidthStr::width(suffix);
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    let limit = max_width.saturating_sub(suffix_w);
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > limit {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str(suffix);
+    out
+}
 
 pub fn fmt_uptime(secs: u64) -> String {
     let h = secs / 3600;
@@ -982,7 +1008,15 @@ impl fmt::Display for StatusData {
             num(self.api_remaining as u64),
             num(self.api_limit as u64)
         );
-        let currently = self.currently_crawling.as_deref().unwrap_or("（空闲）");
+        let currently = if self.currently_crawling.is_empty() {
+            "（空闲）".to_string()
+        } else {
+            self.currently_crawling
+                .iter()
+                .map(|w| format!("{} ({}°)", w.login, w.degree))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         let reset_str = if self.api_reset_at == 0 {
             "（未知）".to_string()
@@ -1019,7 +1053,6 @@ impl fmt::Display for StatusData {
             ("重试", num(self.users_retry)),
             ("错误", num(self.users_error)),
             ("队列", num(self.users_queued)),
-            ("当前度数", format!("{}°", self.current_degree)),
             ("正在爬取", currently.to_string()),
             ("API 剩余", api_str),
             ("下次重置", reset_str),

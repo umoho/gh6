@@ -113,18 +113,24 @@ pub struct CrawlResult {
 // Server state & event types (shared between server and main)
 // ---------------------------------------------------------------------------
 
+/// A worker currently crawling a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrawlingWorker {
+    pub login: String,
+    pub degree: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub users_crawled: u64,
     pub users_queued: u64,
     pub users_retry: u64,
     pub users_error: u64,
-    pub current_degree: i32,
     pub api_remaining: u32,
     pub api_limit: u32,
     pub api_reset_at: i64,
     pub uptime_secs: u64,
-    pub currently_crawling: Option<String>,
+    pub currently_crawling: Vec<CrawlingWorker>,
     pub paused: bool,
 }
 

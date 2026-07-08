@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,13 +15,12 @@ use crate::HUB_FOLLOWING_THRESHOLD;
 use crate::crawlers::{Crawler, FollowCrawler};
 use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
-use crate::types::{CrawlEvent, ServerResponse, StatusData};
+use crate::types::{CrawlEvent, CrawlingWorker, ServerResponse, StatusData};
 
 // ── Shared state ──────────────────────────────────────────────────────────
 
 struct ServerState {
-    currently_crawling: RwLock<Option<String>>,
-    current_degree: AtomicI32,
+    currently_crawling: RwLock<Vec<Option<CrawlingWorker>>>,
     api_remaining: AtomicU32,
     api_limit: AtomicU32,
     api_reset_at: AtomicI64,
@@ -33,10 +32,13 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(event_tx: broadcast::Sender<CrawlEvent>, abort: Arc<AtomicBool>) -> Self {
+    fn new(
+        event_tx: broadcast::Sender<CrawlEvent>,
+        abort: Arc<AtomicBool>,
+        workers: usize,
+    ) -> Self {
         Self {
-            currently_crawling: RwLock::new(None),
-            current_degree: AtomicI32::new(0),
+            currently_crawling: RwLock::new(vec![None; workers]),
             api_remaining: AtomicU32::new(0),
             api_limit: AtomicU32::new(5000),
             api_reset_at: AtomicI64::new(0),
@@ -159,7 +161,7 @@ pub async fn run_daemon(
 
     // 5. Create shared state
     let (event_tx, _) = broadcast::channel(256);
-    let state = Arc::new(ServerState::new(event_tx, Arc::clone(&abort_flag)));
+    let state = Arc::new(ServerState::new(event_tx, Arc::clone(&abort_flag), workers));
 
     // Sync initial rate-limit from client
     {
@@ -191,13 +193,13 @@ pub async fn run_daemon(
     let crawl_state = state.clone();
     let crawl_db = db.clone();
     let cn = crawler_name.clone();
-    for _ in 0..workers {
+    for worker_id in 0..workers {
         let s = crawl_state.clone();
         let d = crawl_db.clone();
         let c = client.clone();
         let n = cn.clone();
         tokio::spawn(async move {
-            crawl_loop(s, d, c, &n).await;
+            crawl_loop(s, d, c, &n, worker_id).await;
         });
     }
     info!("Spawned {workers} crawl worker(s)");
@@ -310,6 +312,7 @@ async fn crawl_loop(
     db: Arc<Mutex<Db>>,
     client: GithubClient,
     crawler_name: &str,
+    worker_id: usize,
 ) {
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
@@ -346,14 +349,17 @@ async fn crawl_loop(
             }
         };
 
-        *state.currently_crawling.write().await = Some(scope.clone());
+        state.currently_crawling.write().await[worker_id] = Some(CrawlingWorker {
+            login: scope.clone(),
+            degree: 0,
+        });
 
         // ── Profile phase: resolve following_count ──
         let following_count = match resolve_following_count(&client, &db, &scope).await {
             Some(c) => c,
             None => {
                 // Profile fetch failed — scope was already reset to retry.
-                *state.currently_crawling.write().await = None;
+                state.currently_crawling.write().await[worker_id] = None;
                 continue;
             }
         };
@@ -386,7 +392,10 @@ async fn crawl_loop(
             }
         };
 
-        state.current_degree.store(degree, Ordering::SeqCst);
+        state.currently_crawling.write().await[worker_id] = Some(CrawlingWorker {
+            login: scope.clone(),
+            degree,
+        });
 
         info!("Crawling: {scope} (degree {degree})");
 
@@ -437,7 +446,7 @@ async fn crawl_loop(
         state.api_limit.store(rl.limit, Ordering::SeqCst);
         state.api_reset_at.store(rl.reset_at, Ordering::SeqCst);
 
-        *state.currently_crawling.write().await = None;
+        state.currently_crawling.write().await[worker_id] = None;
 
         if rl.remaining < 5 {
             let now = SystemTime::now()
@@ -633,14 +642,13 @@ async fn handle_status_watch(
 fn build_status_data(
     state: &ServerState,
     db: &Db,
-    currently_crawling: Option<String>,
+    currently_crawling: Vec<Option<CrawlingWorker>>,
     crawler_name: &str,
 ) -> Result<StatusData, Box<dyn std::error::Error>> {
     let users_crawled = db.get_crawled_count(crawler_name)? as u64;
     let users_queued = db.pending_scopes(crawler_name, 10_000_000)?.len() as u64;
     let users_retry = db.get_retry_count(crawler_name)? as u64;
     let users_error = db.get_error_count(crawler_name)? as u64;
-    let current_degree = state.current_degree.load(Ordering::SeqCst);
     let api_remaining = state.api_remaining.load(Ordering::SeqCst);
     let api_limit = state.api_limit.load(Ordering::SeqCst);
     let api_reset_at = state.api_reset_at.load(Ordering::SeqCst);
@@ -652,12 +660,11 @@ fn build_status_data(
         users_queued,
         users_retry,
         users_error,
-        current_degree,
         api_remaining,
         api_limit,
         api_reset_at,
         uptime_secs,
-        currently_crawling,
+        currently_crawling: currently_crawling.into_iter().flatten().collect(),
         paused,
     })
 }
