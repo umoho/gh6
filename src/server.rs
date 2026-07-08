@@ -11,13 +11,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::HUB_FOLLOWING_THRESHOLD;
 use crate::crawlers::{Crawler, FollowCrawler};
 use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
 use crate::types::{CrawlEvent, ServerResponse, StatusData};
-
-/// Users with more following than this are deferred (priority = 'low').
-const HUB_FOLLOWING_THRESHOLD: i64 = 5000;
 
 // ── Shared state ──────────────────────────────────────────────────────────
 
@@ -152,7 +150,7 @@ pub async fn run_daemon(
                 .upsert_profile(user_id, &profile)
                 .map_err(|e| format!("db error upserting seed profile: {e}"))?;
             db_guard
-                .insert_pending_scope(&crawler_name, &seed, 0)
+                .insert_pending_scope(&crawler_name, &seed, 0, "normal")
                 .map_err(|e| format!("db error seeding scope: {e}"))?;
 
             info!("Seed user '{seed}' added.");
@@ -257,6 +255,54 @@ fn detect_gh_user() -> Result<String, String> {
     Ok(login)
 }
 
+// ── Profile resolution ─────────────────────────────────────────────────
+
+/// Resolve `login`'s `following` count.  Tries the `user_profiles` cache
+/// first; falls back to `GET /users/{login}` if missing.
+///
+/// Returns `None` when the API call fails — the caller is responsible for
+/// setting `currently_crawling = None` and `continue`-ing the crawl loop.
+async fn resolve_following_count(
+    client: &GithubClient,
+    db: &Arc<Mutex<Db>>,
+    login: &str,
+) -> Option<i64> {
+    // Try cache first.
+    {
+        let db_guard = db.lock().await;
+        if let Some(user) = db_guard.get_user_by_login(login).ok().flatten()
+            && db_guard.has_profile(user.id).unwrap_or(false)
+            && let Some(count) = user.following
+        {
+            debug!("profile cached for {login}, following_count={count}");
+            return Some(count);
+        }
+    }
+
+    // Fetch from GitHub API.
+    debug!("fetching profile for {login}…");
+    match client.get_user(login).await {
+        Ok(profile) => {
+            let count = profile.following;
+            debug!("got profile for {login}: following={count}");
+            let db_guard = db.lock().await;
+            let uid = db_guard.insert_user(&profile.login).unwrap_or(0);
+            if uid > 0 {
+                let _ = db_guard.upsert_profile(uid, &profile);
+            }
+            drop(db_guard);
+            Some(count)
+        }
+        Err(e) => {
+            warn!("Failed to fetch profile for {login}: {e}, retrying…");
+            let db_guard = db.lock().await;
+            let _ = db_guard.reset_to_retry(login, &e.to_string());
+            drop(db_guard);
+            None
+        }
+    }
+}
+
 // ── Crawl loop ────────────────────────────────────────────────────────────
 
 async fn crawl_loop(
@@ -302,77 +348,28 @@ async fn crawl_loop(
 
         *state.currently_crawling.write().await = Some(scope.clone());
 
-        // Lazily fetch user profile if missing or stale.
-        let user_id = {
-            let db_guard = db.lock().await;
-            db_guard
-                .get_user_by_login(&scope)
-                .ok()
-                .flatten()
-                .map(|u| u.id)
+        // ── Profile phase: resolve following_count ──
+        let following_count = match resolve_following_count(&client, &db, &scope).await {
+            Some(c) => c,
+            None => {
+                // Profile fetch failed — scope was already reset to retry.
+                *state.currently_crawling.write().await = None;
+                continue;
+            }
         };
 
-        let following_count = if let Some(uid) = user_id {
+        // ── Hub check (unified — no degree condition) ──
+        let is_hub = following_count >= HUB_FOLLOWING_THRESHOLD;
+        if is_hub {
+            info!("Hub detected: {scope} ({following_count} following) — deferring");
             let db_guard = db.lock().await;
-            // Check if profile exists and get following count.
-            if db_guard.has_profile(uid).unwrap_or(false) {
-                db_guard
-                    .get_user_by_login(&scope)
-                    .ok()
-                    .flatten()
-                    .and_then(|u| u.following)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        debug!(
-            "profile check for {scope}: has_profile={}, following_count={:?}",
-            following_count.is_some(),
-            following_count
-        );
-
-        if following_count.is_none() {
-            // Profile missing — fetch it.
-            debug!("fetching profile for {scope}…");
-            match client.get_user(&scope).await {
-                Ok(profile) => {
-                    let count = profile.following;
-                    debug!("got profile for {scope}: following={count}");
-                    let db_guard = db.lock().await;
-                    let uid = db_guard.insert_user(&profile.login).unwrap_or(0);
-                    if uid > 0 {
-                        let _ = db_guard.upsert_profile(uid, &profile);
-                    }
-                    drop(db_guard);
-
-                    if count >= HUB_FOLLOWING_THRESHOLD {
-                        info!("Deferring hub {scope} ({count} following)");
-                        let db_guard = db.lock().await;
-                        let _ = db_guard.set_priority(crawler_name, &scope, "low");
-                        drop(db_guard);
-                        *state.currently_crawling.write().await = None;
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to fetch profile for {scope}: {e}, retrying…");
-                    let db_guard = db.lock().await;
-                    let _ = db_guard.reset_to_retry(&scope, &e.to_string());
-                    drop(db_guard);
-                    *state.currently_crawling.write().await = None;
-                    continue;
-                }
-            }
-        } else {
-            debug!(
-                "profile already cached for {scope}, following_count={}",
-                following_count.unwrap_or(0)
-            );
+            let _ = db_guard.set_priority(crawler_name, &scope, "low");
+            drop(db_guard);
+            // Still proceed to crawl_following — edges are needed for
+            // graph completeness; new scopes inherit low priority.
         }
 
+        // ── Degree calculation ──
         let degree = {
             let db_guard = db.lock().await;
             match db_guard.get_user_by_login(&scope) {
@@ -389,26 +386,13 @@ async fn crawl_loop(
             }
         };
 
-        // Re-check hub threshold for cached profiles.
-        // Only defer hubs at degree 2+ (degree 0-1 must be fully crawled).
-        if degree >= 2 && following_count.unwrap_or(0) >= HUB_FOLLOWING_THRESHOLD {
-            info!(
-                "Deferring hub {scope} ({} following)",
-                following_count.unwrap()
-            );
-            let db_guard = db.lock().await;
-            let _ = db_guard.set_priority(crawler_name, &scope, "low");
-            drop(db_guard);
-            *state.currently_crawling.write().await = None;
-            continue;
-        }
-
         state.current_degree.store(degree, Ordering::SeqCst);
 
         info!("Crawling: {scope} (degree {degree})");
 
         let result =
-            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree).await;
+            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree, is_hub)
+                .await;
 
         match result {
             Ok(crawl_result) => {

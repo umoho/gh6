@@ -42,6 +42,17 @@ impl Db {
         // Run migrations
         conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
 
+        // 002: defer pending scopes discovered by hub users (idempotent).
+        // The threshold is injected from the Rust constant so it stays in
+        // sync with crawl_loop's hub check.
+        {
+            let sql = include_str!("../migrations/002_defer_hub_scopes.sql").replace(
+                "{HUB_THRESHOLD}",
+                &crate::HUB_FOLLOWING_THRESHOLD.to_string(),
+            );
+            conn.execute_batch(&sql)?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -547,36 +558,31 @@ impl Db {
     // -----------------------------------------------------------------------
 
     /// Atomically claim a pending scope (status='pending' → 'in_progress').
-    /// This prevents multiple workers from grabbing the same scope.
-    /// Returns `None` if no pending scopes exist.
+    ///
+    /// Scopes are ordered by priority, degree, and error count — no
+    /// degree-based branching.  Hubs (`following >= HUB_FOLLOWING_THRESHOLD`)
+    /// are assigned low priority at profile time and naturally sink to the
+    /// back of the queue.
     pub fn claim_scope(&self, crawler_name: &str) -> Result<Option<String>, DbError> {
         // Try pending first, then retry (fewer errors first).
         for status in ["pending", "retry"] {
-            for (where_c, order_c) in [
-                (
-                    "degree <= 1",
-                    "ORDER BY degree ASC, CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, error_count ASC",
-                ),
-                (
-                    "degree = 2",
-                    "ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, error_count ASC, degree ASC",
-                ),
-                ("degree >= 3", "ORDER BY error_count ASC, RANDOM()"),
-            ] {
-                let sql = format!(
-                    "UPDATE crawl_state SET status = 'in_progress' \
-                     WHERE rowid = (SELECT rowid FROM crawl_state \
-                       WHERE crawler_name = ?1 AND status = '{status}' \
-                         AND {where_c} {order_c} LIMIT 1) RETURNING scope_key"
-                );
-                match self
-                    .conn
-                    .query_row(&sql, params![crawler_name], |row| row.get::<_, String>(0))
-                {
-                    Ok(scope) => return Ok(Some(scope)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                    Err(e) => return Err(e.into()),
-                }
+            let sql = format!(
+                "UPDATE crawl_state SET status = 'in_progress' \
+                 WHERE rowid = (SELECT rowid FROM crawl_state \
+                   WHERE crawler_name = ?1 AND status = '{status}' \
+                   ORDER BY \
+                     CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
+                     degree ASC, \
+                     error_count ASC \
+                   LIMIT 1) RETURNING scope_key"
+            );
+            match self
+                .conn
+                .query_row(&sql, params![crawler_name], |row| row.get::<_, String>(0))
+            {
+                Ok(scope) => return Ok(Some(scope)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(None)
@@ -639,17 +645,21 @@ impl Db {
         Ok(())
     }
 
-    /// Insert a pending crawl scope. Uses INSERT OR IGNORE for idempotency.
+    /// Insert a pending crawl scope with explicit priority.
+    ///
+    /// Uses INSERT OR IGNORE — if the scope already exists (e.g. discovered
+    /// via a different path) the first-inserted priority wins.
     pub fn insert_pending_scope(
         &self,
         crawler_name: &str,
         scope_key: &str,
         degree: i32,
+        priority: &str,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO crawl_state (crawler_name, scope_key, degree) \
-             VALUES (?1, ?2, ?3)",
-            params![crawler_name, scope_key, degree],
+            "INSERT OR IGNORE INTO crawl_state (crawler_name, scope_key, degree, priority) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![crawler_name, scope_key, degree, priority],
         )?;
         Ok(())
     }

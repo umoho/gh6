@@ -62,6 +62,10 @@ impl FollowCrawler {
     /// and enqueue newly discovered users for the next BFS layer.
     ///
     /// `crawler_name` is the identifier used for `crawl_state` queries.
+    /// `is_hub` controls the priority of newly created pending scopes —
+    /// scopes discovered by a hub inherit `low` priority so they don't
+    /// flood the queue.
+    ///
     /// Only writes `login` to `users`; profile data is written separately
     /// by the caller via `db.upsert_profile()`.
     pub async fn crawl_following(
@@ -70,6 +74,7 @@ impl FollowCrawler {
         db: &AsyncMutex<Db>,
         login: &str,
         current_degree: i32,
+        is_hub: bool,
     ) -> Result<CrawlResult, CrawlerError> {
         debug!("crawl_following({login}): degree={current_degree}, fetching following…");
         // Phase 1: read user id from DB (lock held briefly)
@@ -93,6 +98,7 @@ impl FollowCrawler {
         let mut all_following = Vec::with_capacity(following.len());
         let mut new_edges = Vec::with_capacity(following.len());
         let mut newly_queued = Vec::new();
+        let priority = if is_hub { "low" } else { "normal" };
 
         {
             let db_guard = db.lock().await;
@@ -114,7 +120,12 @@ impl FollowCrawler {
 
                 let already_crawled = db_guard.has_crawl_state(crawler_name, &summary.login)?;
                 if !already_crawled {
-                    db_guard.insert_pending_scope(crawler_name, &summary.login, next_degree)?;
+                    db_guard.insert_pending_scope(
+                        crawler_name,
+                        &summary.login,
+                        next_degree,
+                        priority,
+                    )?;
                     newly_queued.push(summary.login.clone());
                 }
 
@@ -158,6 +169,6 @@ impl Crawler for FollowCrawler {
                 .unwrap_or(0)
         };
 
-        Self::crawl_following(self.name(), client, db, scope_key, current_degree).await
+        Self::crawl_following(self.name(), client, db, scope_key, current_degree, false).await
     }
 }
