@@ -47,11 +47,6 @@ pub fn yellow(s: &str) -> String {
     s.yellow().to_string()
 }
 
-/// Danger / high.
-pub fn red(s: &str) -> String {
-    s.red().to_string()
-}
-
 /// Degree / accent.
 pub fn cyan(s: &str) -> String {
     s.cyan().to_string()
@@ -353,21 +348,6 @@ pub fn path_chain(users: &[&str]) -> String {
 pub fn directed_edge(from: &str, to: &str) -> String {
     let arrow = dim("→");
     format!("{from} {arrow} {to}")
-}
-
-// ── List truncation ───────────────────────────────────────────────────────
-
-/// Join names, show `等 N 人` if truncated.
-pub fn truncate_list(items: &[String], max: usize) -> String {
-    if items.is_empty() {
-        return dim("无");
-    }
-    if items.len() <= max {
-        return items.join(", ");
-    }
-    let shown: Vec<&str> = items.iter().take(max).map(|s| s.as_str()).collect();
-    let remaining = items.len() - max;
-    format!("{} 等 {} 人", shown.join(", "), remaining)
 }
 
 /// Split a list into display items for use in tree nodes.

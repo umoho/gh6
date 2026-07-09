@@ -283,28 +283,6 @@ pub fn cmd_all_paths(
     Ok(result)
 }
 
-pub type FuzzyPathResult = Vec<(User, PathInfo)>;
-
-/// Fuzzy search: find paths from seed to all users matching the query.
-pub fn cmd_fuzzy_path(db: &Db, from: &str, q: &str) -> Result<FuzzyPathResult, Box<dyn Error>> {
-    let matches = db.search_users(q)?;
-    let mut results = Vec::new();
-    for user in matches {
-        let path = db.get_shortest_path(from, &user.login)?;
-        if !path.is_empty() {
-            let directed_edges = path_directed_edges(db, &path)?;
-            results.push((
-                user,
-                PathInfo {
-                    path,
-                    directed_edges,
-                },
-            ));
-        }
-    }
-    Ok(results)
-}
-
 // ---------------------------------------------------------------------------
 // cmd_common
 // ---------------------------------------------------------------------------
@@ -450,12 +428,6 @@ pub fn cmd_user(db: &Db, login: &str) -> Result<UserProfileResult, Box<dyn Error
 // ---------------------------------------------------------------------------
 // cmd_degree_dist
 // ---------------------------------------------------------------------------
-
-/// Return the degree distribution — how many distinct users appear at each
-/// BFS degree level in the edges table.
-pub fn cmd_degree_dist(db: &Db) -> Result<Vec<DegreeDist>, Box<dyn Error>> {
-    Ok(db.degree_distribution()?)
-}
 
 // ---------------------------------------------------------------------------
 // cmd_stats
