@@ -7,8 +7,8 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 
-use crate::db::Db;
-use crate::types::{DegreeDist, User};
+use gh6::db::Db;
+use gh6::types::{DegreeDist, User};
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -618,16 +618,10 @@ pub fn cmd_bridges(db: &Db, limit: usize) -> Result<BridgesResult, Box<dyn Error
 
     // Build adjacency list (undirected, follows only).
     let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-    {
-        let mut stmt = db
-            .conn
-            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-        for pair in rows {
-            let (a, b) = pair?;
-            adj.entry(a).or_default().push(b);
-            adj.entry(b).or_default().push(a);
-        }
+    let pairs = db.get_follows_pairs()?;
+    for (a, b) in pairs {
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
     }
 
     let all_users = db.get_all_users()?;
@@ -868,16 +862,10 @@ pub fn cmd_communities(
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-    {
-        let mut stmt = db
-            .conn
-            .prepare("SELECT from_user_id, to_user_id FROM edges WHERE edge_type = 'follows'")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-        for pair in rows {
-            let (a, b) = pair?;
-            adj.entry(a).or_default().push(b);
-            adj.entry(b).or_default().push(a);
-        }
+    let pairs = db.get_follows_pairs()?;
+    for (a, b) in pairs {
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
     }
 
     let all_users = db.get_all_users()?;

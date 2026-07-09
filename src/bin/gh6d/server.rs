@@ -11,11 +11,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::HUB_FOLLOWING_THRESHOLD;
+use gh6::HUB_FOLLOWING_THRESHOLD;
+use gh6::db::Db;
+use gh6::types::{CrawlEvent, CrawlingWorker, ServerResponse, StatusData};
+
 use crate::crawlers::{Crawler, FollowCrawler};
-use crate::db::Db;
 use crate::github::{GithubApi, GithubClient};
-use crate::types::{CrawlEvent, CrawlingWorker, ServerResponse, StatusData};
 
 // ── Shared state ──────────────────────────────────────────────────────────
 
@@ -71,10 +72,7 @@ pub async fn run_daemon(
     // Reset any stale in_progress scopes from a previous unclean shutdown.
     {
         let db_guard = db.lock().await;
-        if let Err(e) = db_guard.conn.execute(
-            "UPDATE crawl_state SET status = 'pending' WHERE status IN ('in_progress', 'retry')",
-            [],
-        ) {
+        if let Err(e) = db_guard.reset_in_progress_scopes() {
             warn!("Failed to reset stale in_progress scopes: {e}");
         }
     }

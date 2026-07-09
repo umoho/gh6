@@ -2,9 +2,10 @@ use log::debug;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::db::Db;
+use gh6::db::Db;
+use gh6::types::{CrawlResult, GithubUserSummary, NewEdge};
+
 use crate::github::{GithubApi, GithubClient};
-use crate::types::{CrawlResult, GithubUserSummary, NewEdge};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -13,7 +14,7 @@ pub enum CrawlerError {
     #[error("user not found: {0}")]
     UserNotFound(String),
     #[error("database error: {0}")]
-    Db(#[from] crate::db::DbError),
+    Db(#[from] gh6::db::DbError),
     #[error("github api error: {0}")]
     Github(#[from] crate::github::GithubError),
 }

@@ -1,4 +1,4 @@
-use crate::types::{GithubUserProfile, GithubUserSummary, RateLimit};
+use gh6::types::{GithubUserProfile, GithubUserSummary, RateLimit};
 use log::{debug, trace};
 use serde::Deserialize;
 use std::process::Command;

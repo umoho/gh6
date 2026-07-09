@@ -22,7 +22,7 @@ pub enum DbError {
 // ---------------------------------------------------------------------------
 
 pub struct Db {
-    pub(crate) conn: Connection,
+    conn: Connection,
 }
 
 impl Db {
@@ -40,13 +40,13 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL")?;
 
         // Run migrations
-        conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
+        conn.execute_batch(include_str!("migrations/001_init.sql"))?;
 
         // 002: defer pending scopes discovered by hub users (idempotent).
         // The threshold is injected from the Rust constant so it stays in
         // sync with crawl_loop's hub check.
         {
-            let sql = include_str!("../migrations/002_defer_hub_scopes.sql").replace(
+            let sql = include_str!("migrations/002_defer_hub_scopes.sql").replace(
                 "{HUB_THRESHOLD}",
                 &crate::HUB_FOLLOWING_THRESHOLD.to_string(),
             );
@@ -902,6 +902,32 @@ impl Db {
              WHERE edge_type = 'follows' AND is_active = 1",
         )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-crate ad-hoc query helpers
+    // -----------------------------------------------------------------------
+
+    /// Reset in_progress/retry scopes left behind by an unclean shutdown.
+    /// Called once at daemon startup before any worker picks up a scope.
+    pub fn reset_in_progress_scopes(&self) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE crawl_state SET status = 'pending' \
+             WHERE status IN ('in_progress', 'retry')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Return all active follows edges as (from_user_id, to_user_id) pairs.
+    /// Used by graph analysis (bridges, communities) to build adjacency lists.
+    pub fn get_follows_pairs(&self) -> Result<Vec<(i64, i64)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_user_id, to_user_id FROM edges \
+             WHERE edge_type = 'follows' AND is_active = 1",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }

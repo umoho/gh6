@@ -4,8 +4,10 @@
 //! client commands (`gh6 run`, `gh6 pause`, `gh6 status`).
 //!
 //! Managed by systemd (user-level):
-//!   systemctl --user start gh6d
-//!   systemctl --user stop gh6d
+
+mod crawlers;
+mod github;
+mod server;
 
 use clap::Parser;
 use log::info;
@@ -30,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .format_timestamp_secs()
         .init();
     info!("Starting gh6d daemon…");
-    gh6::server::run_daemon(cli.seed, cli.workers).await?;
+    crate::server::run_daemon(cli.seed, cli.workers).await?;
     info!("Daemon stopped.");
     Ok(())
 }

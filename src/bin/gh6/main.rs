@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
+mod analyze;
+mod display;
+mod tui;
+
 use clap::{Parser, Subcommand};
+use gh6::db::Db;
+use gh6::types::*;
 use owo_colors::OwoColorize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-mod tui;
-
-use gh6::analyze;
-use gh6::db::Db;
-use gh6::display::UserView;
-use gh6::types::*;
 
 // ── CLI Definition ───────────────────────────────────────────────────────────
 
@@ -220,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if cli.json {
                             println!("{}", serde_json::to_string(&s)?);
                         } else {
-                            println!("{s}");
+                            println!("{}", display::StatusDisplay(&s));
                         }
                     }
                     Ok(ServerResponse::Error { msg }) => {
@@ -283,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         println!(
                             "{}",
-                            UserView {
+                            display::UserView {
                                 data: &result,
                                 detail,
                             }

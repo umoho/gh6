@@ -18,7 +18,7 @@ use crate::analyze::{
     BridgesResult, CommonResult, CommunitiesResult, PathInfo, RouteResult, StatsResult,
     SuggestResult, UserProfileResult,
 };
-use crate::types::StatusData;
+use gh6::types::StatusData;
 
 // ── Style tokens ──────────────────────────────────────────────────────────
 
@@ -993,11 +993,16 @@ impl fmt::Display for StatsResult {
 
 // ── StatusData (for `gh6 status`) ─────────────────────────────────────────
 
-impl fmt::Display for StatusData {
+/// Orphan-rule newtype: `StatusData` lives in the lib crate so we can't
+/// `impl Display` for it from this binary crate.
+pub struct StatusDisplay<'a>(pub &'a StatusData);
+
+impl fmt::Display for StatusDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = &self.0;
         use chrono::{Local, TimeZone};
 
-        let state_str = if self.paused {
+        let state_str = if s.paused {
             "⏸ 已暂停".to_string()
         } else {
             "▶ 运行中".to_string()
@@ -1005,24 +1010,24 @@ impl fmt::Display for StatusData {
 
         let api_str = format!(
             "{} / {}",
-            num(self.api_remaining as u64),
-            num(self.api_limit as u64)
+            num(s.api_remaining as u64),
+            num(s.api_limit as u64)
         );
-        let currently = if self.currently_crawling.is_empty() {
+        let currently = if s.currently_crawling.is_empty() {
             "（空闲）".to_string()
         } else {
-            self.currently_crawling
+            s.currently_crawling
                 .iter()
                 .map(|w| format!("{} ({}°)", w.login, w.degree))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
 
-        let reset_str = if self.api_reset_at == 0 {
+        let reset_str = if s.api_reset_at == 0 {
             "（未知）".to_string()
         } else {
             let local = Local
-                .timestamp_opt(self.api_reset_at, 0)
+                .timestamp_opt(s.api_reset_at, 0)
                 .single()
                 .map(|dt| dt.format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "?".to_string());
@@ -1030,7 +1035,7 @@ impl fmt::Display for StatusData {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let remaining = (self.api_reset_at - now).max(0);
+            let remaining = (s.api_reset_at - now).max(0);
             let rel = if remaining < 60 {
                 format!("{remaining}s")
             } else if remaining < 3600 {
@@ -1043,16 +1048,16 @@ impl fmt::Display for StatusData {
             format!("{local} (in {rel})")
         };
 
-        let uptime = fmt_uptime(self.uptime_secs);
+        let uptime = fmt_uptime(s.uptime_secs);
 
         writeln!(f, "{}", header("⏳", "gh6", ""))?;
 
         let rows: &[(&str, String)] = &[
             ("服务状态", state_str),
-            ("已爬", num(self.users_crawled)),
-            ("重试", num(self.users_retry)),
-            ("错误", num(self.users_error)),
-            ("队列", num(self.users_queued)),
+            ("已爬", num(s.users_crawled)),
+            ("重试", num(s.users_retry)),
+            ("错误", num(s.users_error)),
+            ("队列", num(s.users_queued)),
             ("正在爬取", currently.to_string()),
             ("API 剩余", api_str),
             ("下次重置", reset_str),

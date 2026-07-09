@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
-use gh6::display;
+use crate::display;
 use gh6::types::{CrawlEvent, ServerResponse, StatusData};
 
 /// Maximum number of event lines to keep in memory.
