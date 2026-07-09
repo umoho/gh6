@@ -26,6 +26,35 @@
 - **gh6d**：守护进程，由 launchd (macOS) 或 systemd (Linux) 管理，启动后处于 IDLE 状态
 - **gh6**：客户端 CLI，通过 Unix socket 向 gh6d 发送命令
 
+### 源码目录结构
+
+```
+src/
+├── lib.rs                     # 库根：pub mod db; pub mod types;
+├── types.rs                   # 共享类型合约（GitHub API / DB / Server / Crawl 类型）
+├── db/
+│   ├── mod.rs                 # 数据库层（稳定层 + 扩展层 + 分析查询）
+│   └── migrations/            # SQL 迁移脚本
+│       ├── 001_init.sql
+│       └── 002_defer_hub_scopes.sql
+└── bin/
+    ├── gh6/                   # gh6 客户端 target
+    │   ├── main.rs            # CLI 入口：clap 解析、socket 通信、结果输出
+    │   ├── analyze.rs         # 分析模块（route, common, user, suggest, bridges, communities, stats, export）
+    │   ├── display.rs         # 终端显示（tree, header, grid, bar 原语 + Display impl）
+    │   └── tui.rs             # TUI 全屏监控（ratatui + crossterm）
+    └── gh6d/                  # gh6d 守护进程 target
+        ├── main.rs            # 守护入口：clap 解析、env_logger 初始化
+        ├── server.rs          # Unix socket 服务 + crawl_loop + 状态管理
+        ├── github.rs          # GitHub API 客户端（通过 gh CLI）
+        └── crawlers/
+            └── mod.rs         # Crawler trait + FollowCrawler 实现
+```
+
+- **`src/lib.rs`** 仅声明两个公共模块（`db` / `types`）和一个常量。分析、显示、爬虫逻辑分别属于 gh6/gh6d 两个 target，编译器在构建单个 binary 时不会解析对方的源码文件
+- **`src/bin/gh6/main.rs`** 和 **`src/bin/gh6d/main.rs`** 是 Cargo 目录式 binary 约定，各自是独立的 crate root，通过 `mod` 声明所属的私有模块，通过 `use gh6::...` 引用 lib 中的公共类型和数据库方法
+- **迁移文件**与数据库代码放在一起（`src/db/migrations/`），不再散落项目根目录
+
 ## 命令体系
 
 ```
