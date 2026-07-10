@@ -559,10 +559,13 @@ impl Db {
 
     /// Atomically claim a pending scope (status='pending' → 'in_progress').
     ///
-    /// Scopes are ordered by priority, degree, and error count — no
-    /// degree-based branching.  Hubs (`following >= HUB_FOLLOWING_THRESHOLD`)
-    /// are assigned low priority at profile time and naturally sink to the
-    /// back of the queue.
+    /// Scopes are ordered by priority, error count, and discovery order
+    /// (rowid).  Hubs (`following >= HUB_FOLLOWING_THRESHOLD` or
+    /// `followers >= HUB_FOLLOWER_THRESHOLD`) are deferred at profile
+    /// resolution time and requeued with low priority.
+    ///
+    /// Discovery order (`rowid ASC`) naturally prioritises scopes closer
+    /// to the seed without the queue blockage caused by strict degree ordering.
     pub fn claim_scope(&self, crawler_name: &str) -> Result<Option<String>, DbError> {
         // Try pending first, then retry (fewer errors first).
         for status in ["pending", "retry"] {

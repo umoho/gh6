@@ -395,15 +395,15 @@ CREATE TABLE config (
 所有 pending scope 按统一规则排序，不再分流：
 
 ```
-ORDER BY priority ASC,   -- high → normal → low
-         degree ASC,     -- 同优先级内浅的优先
-         error_count ASC -- 同度内出错少的优先
+ORDER BY priority ASC,    -- high → normal → low
+         error_count ASC,  -- 同priority内出错少的优先
+         rowid ASC         -- 同error_count内先发现的优先
 ```
 
-不再需要 RANDOM() 随机采样——大 V 的关注者设 low priority 后队列自然可控，
-不会出现 single source 撑爆队列的情况。
+不再需要 `degree ASC` 排序——BFS 严格按层会因单层 scope 量爆炸导致后续层永远等不到。
+改用 `rowid`（发现顺序）后，自然形成"离种子越近越快排到"的效果。
 
-#### 大 V（Hub）判定时机
+#### 大 V（Hub）判定与延迟
 
 大 V 判定在 **profile 查询阶段**（每次爬取前调用 `GET /users/{login}`）进行，检查两个维度：
 
@@ -412,14 +412,16 @@ following_count ≥ HUB_FOLLOWING_THRESHOLD（5000）  ← outbound hub（关注
     OR
 followers_count ≥ HUB_FOLLOWER_THRESHOLD（5000）  ← inbound hub（粉丝太多人）
 
-  └── 是 → 将本 scope 的 priority 设为 low，新 scope 继承 low priority
-          但仍正常执行 crawl_scope（边数据仍需保证完整）
-  └── 否 → 保持 normal
+  └── 是 → 将 scope 的 priority 设为 low，status 重置为 pending，**跳过本次爬取**
+           （回到队列底等所有 normal scope 处理完后再爬）
+  └── 否 → 保持 normal，正常执行
 ```
 
 - outbound hub 的典型场景：刷关注的号（关注 5000+ 人但粉丝很少）
 - inbound hub 的典型场景：名人、大项目（粉丝 5000+ 但关注的人很少）
-- 两类 hub 平等对待：任何一个维度超标即降级，防止新 scope 淹没队列
+- 两类 hub 平等对待：任何一个维度超标即 defer，防止 worker 被长时间占用
+- hub 的 profile 已缓存在 `user_profiles` 中，下次 claim 到时不需再调 API
+- **注意**：目前 normal 队列持续被新 scope 补充，hub 可能长期饥饿。未来可考虑饥饿超时升级机制
 
 #### priority 继承规则
 
@@ -443,20 +445,20 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
 - 速率限制：每次 API 调用后检查 `X-RateLimit-Remaining`，接近 0 时 sleep 到重置窗口
 - **扩散方向**：BFS 沿关注和粉丝两个方向同时扩散
   - 同一 scope 内爬完 following 和 followers 后，两组新用户统一 enqueue
-  - 两个方向不做排序区分，按 `(priority, degree, error_count)` 统一调度
+  - 两个方向不做排序区分，按 `(priority, error_count, rowid)` 统一调度
 
 ### 爬取流程
 
 每条 scope 的处理流程：
 
 ```
-1. claim_scope：认领一条 pending scope（按 priority ASC, degree ASC, error_count ASC 排序）
+1. claim_scope：认领一条 pending scope（按 priority ASC, error_count ASC, rowid ASC 排序）
 2. 取 scope_key（user login）
 3. 调 GET /users/{login} 获取完整 profile（无论是否已缓存）
     ├── 将 profile 写入 user_profiles（INSERT OR REPLACE）
     └── 拿到 following_count + followers_count：
-          ├── following_count ≥ 5000 或 followers_count ≥ 5000 → 设为 low priority
-          └── 均 < 5000 → 保持 normal
+          ├── following_count ≥ 5000 或 followers_count ≥ 5000 → 设为 low + requeue to pending → **跳过**
+          └── 均 < 5000 → 保持 normal，继续执行
 4a. 调 GET /users/{login}/following 获取关注列表（摘要）
 4b. 调 GET /users/{login}/followers 获取粉丝列表（摘要）
      ├── 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
@@ -477,7 +479,10 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
   profile 数据中的 `following` 和 `followers` 字段用于双向 hub 判定。
 - **双向爬取**——每个 scope 同时爬 following 和 followers，不再需要单独的 `FollowerCrawler`。
   两组数据分别在 4a/4b 获取，边和 scope 统一持久化。
-- **crawl_scope 不再按 degree 分层**——所有用户同一套规则，hub 不跳过，但其新 scope 继承 low priority。
+- **Hub 延迟执行**——检测到 hub 后立即 requeue 为 pending，不进入爬取步骤。
+  避免 worker 被大 V 的 massive following/followers 分页长时间占用。
+- **发现序调度**——以 `rowid`（即 scope 首次发现的顺序）代替 `degree` 排序。
+  靠近种子的用户自然优先排程，同时避免严格分层导致的队列堵塞。
 
 ## Traits 设计
 
