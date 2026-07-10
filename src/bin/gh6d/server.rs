@@ -414,58 +414,45 @@ async fn crawl_loop(
                 // Persist results to DB — this is orchestration, not crawler logic.
                 {
                     let db_guard = db.lock().await;
-                    let from_id = match db_guard.get_user_by_login(&scope) {
-                        Ok(Some(u)) => u.id,
-                        _ => {
-                            error!("User {scope} not found in DB after claim; skipping");
-                            state.currently_crawling.write().await[worker_id] = None;
-                            continue;
-                        }
-                    };
 
                     // Helper: insert a follows edge (source → target).
                     // Returns the target login on success.
-                    let persist_edge = |source_name: &str,
-                                        target_summary: &GithubUserSummary|
-                     -> Option<String> {
-                        let target_id = match db_guard.insert_user(&target_summary.login) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                error!("Failed to insert user {}: {e}", target_summary.login);
-                                return None;
-                            }
-                        };
-
-                        // Resolve source user id.
-                        let source_id = if source_name == scope.as_str() {
-                            from_id
-                        } else {
-                            match db_guard.get_user_by_login(source_name) {
-                                Ok(Some(u)) => u.id,
-                                _ => {
-                                    error!("Source user {source_name} not found; skipping edge");
+                    let persist_edge =
+                        |source_name: &str, target_summary: &GithubUserSummary| -> Option<String> {
+                            // Insert both users first — in Phase B the source
+                            // (follower) may be a newly discovered user.
+                            let source_id = match db_guard.insert_user(source_name) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    error!("Failed to insert user {source_name}: {e}");
                                     return None;
                                 }
-                            }
-                        };
+                            };
+                            let target_id = match db_guard.insert_user(&target_summary.login) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    error!("Failed to insert user {}: {e}", target_summary.login);
+                                    return None;
+                                }
+                            };
 
-                        let edge = gh6::types::NewEdge {
-                            from_user_id: source_id,
-                            to_user_id: target_id,
-                            edge_type: "follows".to_string(),
-                            weight: 1.0,
-                            degree: next_degree,
-                            metadata: None,
+                            let edge = gh6::types::NewEdge {
+                                from_user_id: source_id,
+                                to_user_id: target_id,
+                                edge_type: "follows".to_string(),
+                                weight: 1.0,
+                                degree: next_degree,
+                                metadata: None,
+                            };
+                            if let Err(e) = db_guard.insert_edge(&edge) {
+                                error!(
+                                    "Failed to insert edge {source_id}→{target_id} ({login}): {e}",
+                                    login = target_summary.login
+                                );
+                                return None;
+                            }
+                            Some(target_summary.login.clone())
                         };
-                        if let Err(e) = db_guard.insert_edge(&edge) {
-                            error!(
-                                "Failed to insert edge {source_id}→{target_id} ({login}): {e}",
-                                login = target_summary.login
-                            );
-                            return None;
-                        }
-                        Some(target_summary.login.clone())
-                    };
 
                     // ── Phase A: following edges (scope → following) ──
                     for summary in &scope_result.following {
