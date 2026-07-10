@@ -463,30 +463,133 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
   profile 数据本身用于更新 `user_profiles`，其中 `following` 字段用于大 V 判定。
 - **crawl_following 不再按 degree 分层**——所有用户同一套规则，大 V 不跳过，但其新 scope 继承 low priority。
 
-### 扩展预留
+## Traits 设计
 
-后续可添加的爬虫（实现 `Crawler` trait）：
+项目定义了两个核心 trait，形成两层抽象：
 
-- **FollowersCrawler**：爬 `followers` 方向，edge_type='followed_by'
-- **StarCrawler**：爬用户 star 的仓库，找出同仓库的 stargazer，edge_type='starred_same_repo'
-- **OrgCrawler**：爬组织成员关系，edge_type='org_member'
-- **RepoContributorCrawler**：爬仓库贡献者共现关系
+```
+crawl_loop（编排层）
+  │
+  ├── Crawler trait   ← 图探索：scope → (边, 新 scope)
+  │     │
+  │     └── GithubApi trait  ← API 调用：隐藏 HTTP 实现细节
+  │
+  └── DB 读写、队列调度、事件广播、限速监控
+```
 
-### Crawler trait（草案）
+### GithubApi trait — API 抽象
+
+**位置：** `src/bin/gh6d/github.rs`
+
+**职责：** 隐藏「怎么调用 GitHub API」的实现细节，无论底层是 `gh` CLI、`curl`、`reqwest` 还是 mock，消费方不感知。
 
 ```rust
-#[async_trait]
-trait Crawler: Send + Sync {
-    fn name(&self) -> &str;
-    async fn crawl(&self, scope_key: &str, client: &GithubClient, db: &Db) -> Result<CrawlResult>;
-    fn pending_scopes(&self, db: &Db) -> Vec<String>;
-}
-
-struct CrawlResult {
-    new_users: Vec<User>,
-    new_edges: Vec<Edge>,
+pub trait GithubApi: Send + Sync {
+    async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError>;
+    async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
+    fn rate_limit(&self) -> RateLimit;
 }
 ```
+
+**实现一览：**
+
+| 实现 | 调用方式 | 适用场景 |
+|------|---------|---------|
+| `GhClient`（当前） | `gh api` 命令 | 已安装 `gh` CLI 的用户 |
+| `CurlClient`（设想） | `curl` 命令 | 无 `gh` CLI、有 `curl` 的环境 |
+| `ReqwestClient`（设想） | reqwest HTTP 库 | 高性能、不需要外部命令 |
+| `MockClient`（设想） | 返回预置数据 | 测试 |
+
+**设计决策：**
+
+- **`rate_limit()` 保留在 trait 内。** 虽然每个实现的跟踪方式不同（额外端点 vs. 响应头），但对外提供的都是统一的 `RateLimit` 快照。编排层需要它做 UI 展示和限速休眠。
+- **消费方使用 `&dyn GithubApi` 而非泛型。** 所有 worker 共享同一个 API 客户端实例（通过 `Arc`），`&dyn` 直接表达了一个运行时服务引用，无需泛型参数层层传递。网络的延迟远大于 vtable 调用的开销。
+- **错误类型当前使用具体 `GithubError`。** 如有第二个实现，可改为关联类型（`type Error: std::error::Error`）以保留各自的错误信息。
+- **分页细节完全隐藏。** `get_following` 内部处理手动翻页、取消信号检查，调用方只收到最终的 `Vec`。
+- **取消信号通过构造函数注入。** 当前 `GhClient::new(abort_flag)` 在构造时传入 `Arc<AtomicBool>`，用于分页循环中断。ReqwestClient 则可用 tokio 的 native future 取消——具体机制是实现的内部细节，不出现在 trait 签名中。
+
+### Crawler trait — 图探索抽象
+
+**位置：** `src/bin/gh6d/crawlers/mod.rs`
+
+**职责：** 把一个 scope 转化为「边 + 新 scope」——即图探索的核心逻辑。**只做纯数据转换，不碰 DB、不管理队列。**
+
+```rust
+/// 图探索器：输入一个 scope，产出边和新 scope。
+///
+/// 类比 Web 爬虫：给定 URL → 下载页面 → 提取链接 → 新 URL 入队。
+pub trait Crawler: Send + Sync {
+    /// 唯一标识，对应 crawl_state.crawler_name。
+    fn name(&self) -> &str;
+
+    /// 爬取一个 scope，返回发现的边和新的 scope。
+    ///
+    /// # 契约
+    ///
+    /// - **不读写数据库。** 返回的数据用 login 标识用户，不含 DB 生成的 ID。
+    /// - **只通过 `api` 获取数据。** 不做网络请求之外的异步等待。
+    /// - **不分页。** 分页是 GithubApi 实现的事，Crawler 只拿到最终结果。
+    async fn crawl_scope(
+        &self,
+        scope: &CrawlScope,
+        api: &dyn GithubApi,
+    ) -> Result<ScopeResult, CrawlerError>;
+}
+
+/// 调用方传入的 scope 信息。
+pub struct CrawlScope {
+    pub key: String,       // 对 FollowCrawler 来说是 login；未来可以是 repo full_name 等
+    pub degree: i32,       // 编排层从 DB 算好传入，Crawler 不需要自己算
+}
+
+/// 纯数据结果——由编排层负责写入 DB。
+pub struct ScopeResult {
+    pub edges: Vec<NewEdgeRaw>,
+    pub discovered_scopes: Vec<String>,
+}
+
+pub struct NewEdgeRaw {
+    pub from_login: String,
+    pub to_login: String,
+    pub edge_type: String,
+    pub weight: f64,
+}
+```
+
+#### Crawler 的职责边界
+
+**属于 Crawler（图探索）：** 找出新的连接和新的探索目标。
+
+```
+输入 scope → 调 API → 产出边 + 新 scope
+```
+
+**不属于 Crawler（编排层的职责）：**
+
+| 操作 | 为什么不属于 | 谁负责 |
+|------|-------------|--------|
+| Profile 补齐 | 给已有节点补数据，不产生边和新 scope | 编排层的 `resolve_following_count()` |
+| 头像下载 | 资源缓存，与图结构无关 | 独立的下载工具 |
+| Hub 检测 & 降级 | 队列策略，不是图探索本身 | 编排层（拿到 following_count 后决定） |
+| Degree 计算 | 基于图中已有的边计算，是图属性的查询 | 编排层（从 DB 读 `edges.degree`） |
+| DB 读写 | 存储和查询基础设施 | 编排层统一写入 |
+| 速率限制 | API 调用的监控，与被爬取的维度无关 | 编排层读 `api.rate_limit()` |
+
+判断标准：**操作是否产出人与人之间的连接 + 下一轮要探索的 scope。**
+
+#### 扩展预留
+
+后续可添加的爬虫（各自实现 `Crawler` trait）：
+
+| Crawler | 关系 | API | 产出 edge_type |
+|---------|------|-----|---------------|
+| `FollowCrawler`（已实现） | A 关注了 B | `GET /users/A/following` | `follows` |
+| `FollowerCrawler` | B 关注了 A | `GET /users/A/followers` | `follows`（方向相反） |
+| `OrgCrawler` | A 与 B 同属组织 O | `GET /users/A/orgs` → `GET /orgs/O/members` | `org_member` |
+| `StarCrawler` | A 和 B 都 star 了仓库 R | `GET /users/A/starred` → `GET /repos/R/stargazers` | `co_starred` |
+| `ContributeCrawler` | A 和 B 共同贡献了仓库 R | `GET /users/A/repos?type=contributor` → `GET /repos/R/contributors` | `co_contributed` |
+
+每个 Crawler 只需关注一种关系的 API 调用和映射逻辑。队列调度、DB 写入、事件分发由编排层统一复用，不会有代码重复。
 
 ## 分析模块
 
