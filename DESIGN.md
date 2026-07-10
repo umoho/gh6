@@ -403,16 +403,23 @@ ORDER BY priority ASC,   -- high → normal → low
 不再需要 RANDOM() 随机采样——大 V 的关注者设 low priority 后队列自然可控，
 不会出现 single source 撑爆队列的情况。
 
-#### 大 V 判定时机
+#### 大 V（Hub）判定时机
 
-大 V 判定在 **profile 查询阶段**（每次爬取前调用 `GET /users/{login}`）进行：
+大 V 判定在 **profile 查询阶段**（每次爬取前调用 `GET /users/{login}`）进行，检查两个维度：
 
 ```
-following_count ≥ HUB_FOLLOWING_THRESHOLD（5000）
-  └── 是 → 将本 scope 的 priority 设为 low（下次不再优先爬取本人）
-          但仍正常执行 crawl_following，新 scope 也继承 low priority
-  └── 否 → 保持 normal，正常执行 crawl_following
+following_count ≥ HUB_FOLLOWING_THRESHOLD（5000）  ← outbound hub（关注了太多人）
+    OR
+followers_count ≥ HUB_FOLLOWER_THRESHOLD（5000）  ← inbound hub（粉丝太多人）
+
+  └── 是 → 将本 scope 的 priority 设为 low，新 scope 继承 low priority
+          但仍正常执行 crawl_scope（边数据仍需保证完整）
+  └── 否 → 保持 normal
 ```
+
+- outbound hub 的典型场景：刷关注的号（关注 5000+ 人但粉丝很少）
+- inbound hub 的典型场景：名人、大项目（粉丝 5000+ 但关注的人很少）
+- 两类 hub 平等对待：任何一个维度超标即降级，防止新 scope 淹没队列
 
 #### priority 继承规则
 
@@ -426,12 +433,17 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
 - 普通人发现的所有用户 → `normal`（正常调度）
 - 已在队列中的 scope 不会被覆盖（INSERT OR IGNORE，先到先得）
 
-### 第一阶段：FollowCrawler
+### 第一阶段：FollowCrawler（双向）
 
-- 方向：单向，只爬 `following`（用户关注的人）
+- 方向：**双向**——同时爬 `following`（用户关注的人）和 `followers`（用户的粉丝）
 - 边类型：`"follows"`，weight 1.0
+  - following 边方向：`from = 当前用户`, `to = 被关注的人`
+  - follower 边方向：`from = 粉丝`, `to = 当前用户`
 - 种子用户：可配置（`gh6d --seed`，默认自动探测 `gh api /user`），存入 `config` 表
 - 速率限制：每次 API 调用后检查 `X-RateLimit-Remaining`，接近 0 时 sleep 到重置窗口
+- **扩散方向**：BFS 沿关注和粉丝两个方向同时扩散
+  - 同一 scope 内爬完 following 和 followers 后，两组新用户统一 enqueue
+  - 两个方向不做排序区分，按 `(priority, degree, error_count)` 统一调度
 
 ### 爬取流程
 
@@ -442,16 +454,18 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
 2. 取 scope_key（user login）
 3. 调 GET /users/{login} 获取完整 profile（无论是否已缓存）
     ├── 将 profile 写入 user_profiles（INSERT OR REPLACE）
-    └── 拿到 following_count：
-          ├── ≥ 5000 → 将本 scope 的 priority 设为 low
-          └── < 5000 → 保持 normal
-4. 调 GET /users/{login}/following 获取该用户的关注列表（摘要）
-    ├── 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
-    ├── 将 following 关系写入 edges 表（edge_type='follows', degree=当前度+1, is_active=1）
-    └── 对于每个新发现用户：
-          ├── 如果尚未在 crawl_state 中：创建 pending 记录
-          │     └── priority = 如果当前用户是 ≥ 5000 的大 V 则 low，否则 normal
-          └── 如果已有 crawl_state 记录：忽略（INSERT OR IGNORE）
+    └── 拿到 following_count + followers_count：
+          ├── following_count ≥ 5000 或 followers_count ≥ 5000 → 设为 low priority
+          └── 均 < 5000 → 保持 normal
+4a. 调 GET /users/{login}/following 获取关注列表（摘要）
+4b. 调 GET /users/{login}/followers 获取粉丝列表（摘要）
+     ├── 将新发现的 login 写入 users 表（如不存在；只写 login，不碰 profile）
+     ├── 将 following 关系写入 edges：from=当前用户, to=被关注者
+     ├── 将 follower 关系写入 edges：from=粉丝, to=当前用户
+     └── 对于每个新发现用户：
+           ├── 如果尚未在 crawl_state 中：创建 pending 记录
+           │     └── priority = 如果当前用户是 hub 则 low，否则 normal
+           └── 如果已有 crawl_state 记录：忽略（INSERT OR IGNORE）
 5. 将该 scope_key 标记为 done
 6. 广播 CrawlEvent（UserDone + UserQueued）
 7. 检查 AtomicBool 是否应停止
@@ -459,9 +473,11 @@ insert_pending_scope(scope_key, degree, priority = current_user_is_hub ? "low" :
 ```
 
 关键差异：
-- **profile 查询不再有条件**——每次爬取前都调完整 API（不再是"如果 user_profiles 中无此用户或 fetched_at 过期"）。
-  profile 数据本身用于更新 `user_profiles`，其中 `following` 字段用于大 V 判定。
-- **crawl_following 不再按 degree 分层**——所有用户同一套规则，大 V 不跳过，但其新 scope 继承 low priority。
+- **profile 查询不再有条件**——每次爬取前都调完整 API。
+  profile 数据中的 `following` 和 `followers` 字段用于双向 hub 判定。
+- **双向爬取**——每个 scope 同时爬 following 和 followers，不再需要单独的 `FollowerCrawler`。
+  两组数据分别在 4a/4b 获取，边和 scope 统一持久化。
+- **crawl_scope 不再按 degree 分层**——所有用户同一套规则，hub 不跳过，但其新 scope 继承 low priority。
 
 ## Traits 设计
 
@@ -487,6 +503,7 @@ crawl_loop（编排层）
 pub trait GithubApi: Send + Sync {
     async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError>;
     async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
+    async fn get_followers(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
     fn rate_limit(&self) -> RateLimit;
 }
 ```
@@ -544,15 +561,10 @@ pub struct CrawlScope {
 
 /// 纯数据结果——由编排层负责写入 DB。
 pub struct ScopeResult {
-    pub edges: Vec<NewEdgeRaw>,
-    pub discovered_scopes: Vec<String>,
-}
-
-pub struct NewEdgeRaw {
-    pub from_login: String,
-    pub to_login: String,
-    pub edge_type: String,
-    pub weight: f64,
+    /// Users that this scope follows (from GET /users/{login}/following).
+    pub following: Vec<GithubUserSummary>,
+    /// Users that follow this scope (from GET /users/{login}/followers).
+    pub followers: Vec<GithubUserSummary>,
 }
 ```
 
@@ -583,8 +595,7 @@ pub struct NewEdgeRaw {
 
 | Crawler | 关系 | API | 产出 edge_type |
 |---------|------|-----|---------------|
-| `FollowCrawler`（已实现） | A 关注了 B | `GET /users/A/following` | `follows` |
-| `FollowerCrawler` | B 关注了 A | `GET /users/A/followers` | `follows`（方向相反） |
+| `FollowCrawler`（已实现） | A 关注了 B + B 关注了 A | `GET /users/A/following` + `GET /users/A/followers` | `follows`（双向） |
 | `OrgCrawler` | A 与 B 同属组织 O | `GET /users/A/orgs` → `GET /orgs/O/members` | `org_member` |
 | `StarCrawler` | A 和 B 都 star 了仓库 R | `GET /users/A/starred` → `GET /repos/R/stargazers` | `co_starred` |
 | `ContributeCrawler` | A 和 B 共同贡献了仓库 R | `GET /users/A/repos?type=contributor` → `GET /repos/R/contributors` | `co_contributed` |
