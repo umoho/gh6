@@ -370,7 +370,11 @@ async fn crawl_loop(
             );
             let db_guard = db.lock().await;
             let _ = db_guard.set_priority(crawler_name, &scope, "low");
+            let _ = db_guard.requeue_pending(crawler_name, &scope);
             drop(db_guard);
+            // Hub deferred — skip this scope and pick up the next one.
+            // currently_crawling is not set yet at this point, so no cleanup needed.
+            continue;
         }
 
         // ── Degree calculation ──

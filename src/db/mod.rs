@@ -572,7 +572,8 @@ impl Db {
                    WHERE crawler_name = ?1 AND status = '{status}' \
                    ORDER BY \
                      CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
-                     error_count ASC \
+                     error_count ASC, \
+                     rowid ASC \
                    LIMIT 1) RETURNING scope_key"
             );
             match self
@@ -639,6 +640,16 @@ impl Db {
         self.conn.execute(
             "UPDATE crawl_state SET status = 'done', crawled_at = datetime('now') \
              WHERE crawler_name = ?1 AND scope_key = ?2",
+            params![crawler_name, scope_key],
+        )?;
+        Ok(())
+    }
+
+    /// Reset an in-progress scope back to pending (used when deferring hubs).
+    pub fn requeue_pending(&self, crawler_name: &str, scope_key: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE crawl_state SET status = 'pending' \
+             WHERE crawler_name = ?1 AND scope_key = ?2 AND status = 'in_progress'",
             params![crawler_name, scope_key],
         )?;
         Ok(())
