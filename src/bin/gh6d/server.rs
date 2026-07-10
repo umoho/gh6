@@ -11,9 +11,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use gh6::HUB_FOLLOWER_THRESHOLD;
 use gh6::HUB_FOLLOWING_THRESHOLD;
 use gh6::db::Db;
-use gh6::types::{CrawlEvent, CrawlScope, CrawlingWorker, ServerResponse, StatusData};
+use gh6::types::{
+    CrawlEvent, CrawlScope, CrawlingWorker, GithubUserSummary, ServerResponse, StatusData,
+};
 
 use crate::crawlers::{Crawler, FollowCrawler};
 use crate::github::{GithubApi, GithubClient};
@@ -255,25 +258,26 @@ fn detect_gh_user() -> Result<String, String> {
 
 // ── Profile resolution ─────────────────────────────────────────────────
 
-/// Resolve `login`'s `following` count.  Tries the `user_profiles` cache
-/// first; falls back to `GET /users/{login}` if missing.
+/// Resolve `login`'s `following` and `followers` counts.  Tries the
+/// `user_profiles` cache first; falls back to `GET /users/{login}` if missing.
 ///
 /// Returns `None` when the API call fails — the caller is responsible for
 /// setting `currently_crawling = None` and `continue`-ing the crawl loop.
-async fn resolve_following_count(
+async fn resolve_profile_counts(
     client: &impl GithubApi,
     db: &Arc<Mutex<Db>>,
     login: &str,
-) -> Option<i64> {
+) -> Option<(i64, i64)> {
     // Try cache first.
     {
         let db_guard = db.lock().await;
         if let Some(user) = db_guard.get_user_by_login(login).ok().flatten()
             && db_guard.has_profile(user.id).unwrap_or(false)
-            && let Some(count) = user.following
+            && let Some(following) = user.following
+            && let Some(followers) = user.followers
         {
-            debug!("profile cached for {login}, following_count={count}");
-            return Some(count);
+            debug!("profile cached for {login}, following={following}, followers={followers}");
+            return Some((following, followers));
         }
     }
 
@@ -281,15 +285,16 @@ async fn resolve_following_count(
     debug!("fetching profile for {login}…");
     match client.get_user(login).await {
         Ok(profile) => {
-            let count = profile.following;
-            debug!("got profile for {login}: following={count}");
+            let following = profile.following;
+            let followers = profile.followers;
+            debug!("got profile for {login}: following={following}, followers={followers}");
             let db_guard = db.lock().await;
             let uid = db_guard.insert_user(&profile.login).unwrap_or(0);
             if uid > 0 {
                 let _ = db_guard.upsert_profile(uid, &profile);
             }
             drop(db_guard);
-            Some(count)
+            Some((following, followers))
         }
         Err(e) => {
             warn!("Failed to fetch profile for {login}: {e}, retrying…");
@@ -346,25 +351,26 @@ async fn crawl_loop(
             }
         };
 
-        // ── Profile phase: resolve following_count ──
-        let following_count = match resolve_following_count(&client, &db, &scope).await {
-            Some(c) => c,
-            None => {
-                // Profile fetch failed — scope was already reset to retry. No
-                // currently_crawling entry to clear because we haven't set one yet.
-                continue;
-            }
-        };
+        // ── Profile phase: resolve following_count + followers_count ──
+        let (following_count, followers_count) =
+            match resolve_profile_counts(&client, &db, &scope).await {
+                Some(counts) => counts,
+                None => {
+                    // Profile fetch failed — scope was already reset to retry.
+                    continue;
+                }
+            };
 
-        // ── Hub check (unified — no degree condition) ──
-        let is_hub = following_count >= HUB_FOLLOWING_THRESHOLD;
+        // ── Hub check (outbound + inbound) ──
+        let is_hub =
+            following_count >= HUB_FOLLOWING_THRESHOLD || followers_count >= HUB_FOLLOWER_THRESHOLD;
         if is_hub {
-            info!("Hub detected: {scope} ({following_count} following) — deferring");
+            info!(
+                "Hub detected: {scope} ({following_count} following, {followers_count} followers) — deferring"
+            );
             let db_guard = db.lock().await;
             let _ = db_guard.set_priority(crawler_name, &scope, "low");
             drop(db_guard);
-            // Still proceed to crawl_following — edges are needed for
-            // graph completeness; new scopes inherit low priority.
         }
 
         // ── Degree calculation ──
@@ -417,18 +423,35 @@ async fn crawl_loop(
                         }
                     };
 
-                    for summary in &scope_result.following {
-                        let to_id = match db_guard.insert_user(&summary.login) {
+                    // Helper: insert a follows edge (source → target).
+                    // Returns the target login on success.
+                    let persist_edge = |source_name: &str,
+                                        target_summary: &GithubUserSummary|
+                     -> Option<String> {
+                        let target_id = match db_guard.insert_user(&target_summary.login) {
                             Ok(id) => id,
                             Err(e) => {
-                                error!("Failed to insert user {}: {e}", summary.login);
-                                continue;
+                                error!("Failed to insert user {}: {e}", target_summary.login);
+                                return None;
+                            }
+                        };
+
+                        // Resolve source user id.
+                        let source_id = if source_name == scope.as_str() {
+                            from_id
+                        } else {
+                            match db_guard.get_user_by_login(source_name) {
+                                Ok(Some(u)) => u.id,
+                                _ => {
+                                    error!("Source user {source_name} not found; skipping edge");
+                                    return None;
+                                }
                             }
                         };
 
                         let edge = gh6::types::NewEdge {
-                            from_user_id: from_id,
-                            to_user_id: to_id,
+                            from_user_id: source_id,
+                            to_user_id: target_id,
                             edge_type: "follows".to_string(),
                             weight: 1.0,
                             degree: next_degree,
@@ -436,27 +459,64 @@ async fn crawl_loop(
                         };
                         if let Err(e) = db_guard.insert_edge(&edge) {
                             error!(
-                                "Failed to insert edge {from_id}→{to_id} ({login}): {e}",
-                                login = summary.login
+                                "Failed to insert edge {source_id}→{target_id} ({login}): {e}",
+                                login = target_summary.login
                             );
-                            continue;
+                            return None;
                         }
-                        new_edges_count += 1;
+                        Some(target_summary.login.clone())
+                    };
 
-                        let already_crawled = db_guard
-                            .has_crawl_state(crawler_name, &summary.login)
-                            .unwrap_or(true);
-                        if !already_crawled {
-                            if let Err(e) = db_guard.insert_pending_scope(
-                                crawler_name,
-                                &summary.login,
-                                next_degree,
-                                priority,
-                            ) {
-                                error!("Failed to enqueue {}: {e}", summary.login);
-                                continue;
+                    // ── Phase A: following edges (scope → following) ──
+                    for summary in &scope_result.following {
+                        if let Some(login) = persist_edge(&scope, summary) {
+                            new_edges_count += 1;
+
+                            let already_crawled = db_guard
+                                .has_crawl_state(crawler_name, &login)
+                                .unwrap_or(true);
+                            if !already_crawled {
+                                if let Err(e) = db_guard.insert_pending_scope(
+                                    crawler_name,
+                                    &login,
+                                    next_degree,
+                                    priority,
+                                ) {
+                                    error!("Failed to enqueue {}: {e}", login);
+                                    continue;
+                                }
+                                newly_queued.push(login);
                             }
-                            newly_queued.push(summary.login.clone());
+                        }
+                    }
+
+                    // ── Phase B: follower edges (follower → scope) ──
+                    for summary in &scope_result.followers {
+                        let login = persist_edge(
+                            &summary.login,
+                            &GithubUserSummary {
+                                login: scope.clone(),
+                                avatar_url: None,
+                            },
+                        );
+                        if login.is_some() {
+                            new_edges_count += 1;
+
+                            let already_crawled = db_guard
+                                .has_crawl_state(crawler_name, &summary.login)
+                                .unwrap_or(true);
+                            if !already_crawled {
+                                if let Err(e) = db_guard.insert_pending_scope(
+                                    crawler_name,
+                                    &summary.login,
+                                    next_degree,
+                                    priority,
+                                ) {
+                                    error!("Failed to enqueue {}: {e}", summary.login);
+                                    continue;
+                                }
+                                newly_queued.push(summary.login.clone());
+                            }
                         }
                     }
 

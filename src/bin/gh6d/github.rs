@@ -35,6 +35,7 @@ pub enum GithubError {
 pub trait GithubApi: Send + Sync {
     async fn get_user(&self, login: &str) -> Result<GithubUserProfile, GithubError>;
     async fn get_following(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
+    async fn get_followers(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError>;
     fn rate_limit(&self) -> RateLimit;
 }
 
@@ -238,6 +239,42 @@ impl GithubApi for GhClient {
             users.extend(batch.into_iter().map(GithubUserSummary::from));
             debug!(
                 "get_following({login}): page {page} -> {batch_size} users, total={}",
+                users.len()
+            );
+            self.refresh_rate_limit().await;
+            page += 1;
+        }
+
+        Ok(users)
+    }
+
+    async fn get_followers(&self, login: &str) -> Result<Vec<GithubUserSummary>, GithubError> {
+        let mut users = Vec::new();
+        let mut page = 1u32;
+        debug!("get_followers({login}): starting manual pagination");
+        loop {
+            if self.abort.load(Ordering::SeqCst) {
+                debug!("get_followers({login}): aborted at page {page}");
+                break;
+            }
+            trace!("get_followers({login}): fetching page {page}");
+            let json = self
+                .gh(&[&format!(
+                    "/users/{login}/followers?page={page}&per_page=100"
+                )])
+                .await?;
+            let batch: Vec<GhUserSummary> = serde_json::from_str(&json)?;
+            let batch_size = batch.len();
+            if batch.is_empty() {
+                debug!(
+                    "get_followers({login}): page {page} empty, done. total={}",
+                    users.len()
+                );
+                break;
+            }
+            users.extend(batch.into_iter().map(GithubUserSummary::from));
+            debug!(
+                "get_followers({login}): page {page} -> {batch_size} users, total={}",
                 users.len()
             );
             self.refresh_rate_limit().await;

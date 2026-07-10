@@ -113,8 +113,10 @@ pub struct CrawlScope {
 /// is responsible for resolving logins to user IDs and persisting edges.
 #[derive(Debug)]
 pub struct ScopeResult {
-    /// The entities found (e.g., users that the scope follows).
+    /// Users that this scope follows (from GET /users/{login}/following).
     pub following: Vec<GithubUserSummary>,
+    /// Users that follow this scope (from GET /users/{login}/followers).
+    pub followers: Vec<GithubUserSummary>,
 }
 
 // ---------------------------------------------------------------------------

@@ -78,18 +78,23 @@ impl Crawler for FollowCrawler {
         api: &A,
     ) -> Result<ScopeResult, CrawlerError> {
         debug!(
-            "crawl_scope({}): degree={}, fetching following…",
+            "crawl_scope({}): degree={}, fetching following + followers…",
             scope.key, scope.degree
         );
 
         let following: Vec<GithubUserSummary> = api.get_following(&scope.key).await?;
+        let followers: Vec<GithubUserSummary> = api.get_followers(&scope.key).await?;
 
         debug!(
-            "crawl_scope({}): got {} following",
+            "crawl_scope({}): got {} following, {} followers",
             scope.key,
-            following.len()
+            following.len(),
+            followers.len()
         );
 
-        Ok(ScopeResult { following })
+        Ok(ScopeResult {
+            following,
+            followers,
+        })
     }
 }
