@@ -101,12 +101,20 @@ pub struct DegreeDist {
 // Crawler types (produced by crawlers/mod.rs)
 // ---------------------------------------------------------------------------
 
+/// Input to a crawl operation.  Degree is computed by the orchestration layer
+/// and passed in — the crawler does not calculate it.
 #[derive(Debug)]
-pub struct CrawlResult {
+pub struct CrawlScope {
+    pub key: String,
+    pub degree: i32,
+}
+
+/// Pure-data result from a crawler.  No DB IDs — the orchestration layer
+/// is responsible for resolving logins to user IDs and persisting edges.
+#[derive(Debug)]
+pub struct ScopeResult {
+    /// The entities found (e.g., users that the scope follows).
     pub following: Vec<GithubUserSummary>,
-    pub new_edges: Vec<NewEdge>,
-    /// Logins that were actually added to crawl_state (not already known).
-    pub newly_queued: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

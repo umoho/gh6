@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use gh6::HUB_FOLLOWING_THRESHOLD;
 use gh6::db::Db;
-use gh6::types::{CrawlEvent, CrawlingWorker, ServerResponse, StatusData};
+use gh6::types::{CrawlEvent, CrawlScope, CrawlingWorker, ServerResponse, StatusData};
 
 use crate::crawlers::{Crawler, FollowCrawler};
 use crate::github::{GithubApi, GithubClient};
@@ -190,14 +190,12 @@ pub async fn run_daemon(
     // 7. Spawn crawl workers (start paused, wait for 'gh6 run')
     let crawl_state = state.clone();
     let crawl_db = db.clone();
-    let cn = crawler_name.clone();
     for worker_id in 0..workers {
         let s = crawl_state.clone();
         let d = crawl_db.clone();
         let c = client.clone();
-        let n = cn.clone();
         tokio::spawn(async move {
-            crawl_loop(s, d, c, &n, worker_id).await;
+            crawl_loop(s, d, c, worker_id).await;
         });
     }
     info!("Spawned {workers} crawl worker(s)");
@@ -263,7 +261,7 @@ fn detect_gh_user() -> Result<String, String> {
 /// Returns `None` when the API call fails — the caller is responsible for
 /// setting `currently_crawling = None` and `continue`-ing the crawl loop.
 async fn resolve_following_count(
-    client: &GithubClient,
+    client: &impl GithubApi,
     db: &Arc<Mutex<Db>>,
     login: &str,
 ) -> Option<i64> {
@@ -309,9 +307,10 @@ async fn crawl_loop(
     state: Arc<ServerState>,
     db: Arc<Mutex<Db>>,
     client: GithubClient,
-    crawler_name: &str,
     worker_id: usize,
 ) {
+    let crawler = FollowCrawler::new();
+    let crawler_name = crawler.name();
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
             info!("Shutdown signaled, exiting crawl loop…");
@@ -392,25 +391,90 @@ async fn crawl_loop(
 
         info!("Crawling: {scope} (degree {degree})");
 
-        let result =
-            FollowCrawler::crawl_following(crawler_name, &client, &db, &scope, degree, is_hub)
-                .await;
+        // Delegate to the Crawler trait — pure API call, no DB.
+        let crawl_scope_cfg = CrawlScope {
+            key: scope.clone(),
+            degree,
+        };
+        let result = crawler.crawl_scope(&crawl_scope_cfg, &client).await;
 
         match result {
-            Ok(crawl_result) => {
-                let new_connections = crawl_result.new_edges.len();
+            Ok(scope_result) => {
+                let next_degree = degree + 1;
+                let priority = if is_hub { "low" } else { "normal" };
+                let mut new_edges_count = 0usize;
+                let mut newly_queued = Vec::new();
+
+                // Persist results to DB — this is orchestration, not crawler logic.
+                {
+                    let db_guard = db.lock().await;
+                    let from_id = match db_guard.get_user_by_login(&scope) {
+                        Ok(Some(u)) => u.id,
+                        _ => {
+                            error!("User {scope} not found in DB after claim; skipping");
+                            state.currently_crawling.write().await[worker_id] = None;
+                            continue;
+                        }
+                    };
+
+                    for summary in &scope_result.following {
+                        let to_id = match db_guard.insert_user(&summary.login) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("Failed to insert user {}: {e}", summary.login);
+                                continue;
+                            }
+                        };
+
+                        let edge = gh6::types::NewEdge {
+                            from_user_id: from_id,
+                            to_user_id: to_id,
+                            edge_type: "follows".to_string(),
+                            weight: 1.0,
+                            degree: next_degree,
+                            metadata: None,
+                        };
+                        if let Err(e) = db_guard.insert_edge(&edge) {
+                            error!(
+                                "Failed to insert edge {from_id}→{to_id} ({login}): {e}",
+                                login = summary.login
+                            );
+                            continue;
+                        }
+                        new_edges_count += 1;
+
+                        let already_crawled = db_guard
+                            .has_crawl_state(crawler_name, &summary.login)
+                            .unwrap_or(true);
+                        if !already_crawled {
+                            if let Err(e) = db_guard.insert_pending_scope(
+                                crawler_name,
+                                &summary.login,
+                                next_degree,
+                                priority,
+                            ) {
+                                error!("Failed to enqueue {}: {e}", summary.login);
+                                continue;
+                            }
+                            newly_queued.push(summary.login.clone());
+                        }
+                    }
+
+                    if let Err(e) = db_guard.mark_crawl_done(crawler_name, &scope) {
+                        error!("Failed to mark {scope} done: {e}");
+                    }
+                }
 
                 let _ = state.event_tx.send(CrawlEvent::UserDone {
                     login: scope.clone(),
                     degree,
-                    new_connections,
+                    new_connections: new_edges_count,
                 });
 
-                let next_degree = degree + 1;
                 // Only send UserQueued for logins that were actually added
                 // to crawl_state (newly discovered), not for the entire
                 // following list.
-                for login in &crawl_result.newly_queued {
+                for login in &newly_queued {
                     let _ = state.event_tx.send(CrawlEvent::UserQueued {
                         login: login.clone(),
                         degree: next_degree,
@@ -418,15 +482,13 @@ async fn crawl_loop(
                 }
 
                 info!(
-                    "Done: {new_connections} new connections, {} users in following",
-                    crawl_result.following.len()
+                    "Done: {new_edges_count} new connections, {} users in following",
+                    scope_result.following.len()
                 );
             }
             Err(e) => {
                 error!("Error crawling {scope}: {e}");
                 // Reset to retry — another worker will pick it up later.
-                // Network errors are transient; permanent errors (404) would
-                // be caught separately via mark_error().
                 let db_guard = db.lock().await;
                 if let Err(e2) = db_guard.reset_to_retry(&scope, &e.to_string()) {
                     error!("Also failed to reset {scope}: {e2}");
