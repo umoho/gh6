@@ -572,7 +572,6 @@ impl Db {
                    WHERE crawler_name = ?1 AND status = '{status}' \
                    ORDER BY \
                      CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 END, \
-                     degree ASC, \
                      error_count ASC \
                    LIMIT 1) RETURNING scope_key"
             );
