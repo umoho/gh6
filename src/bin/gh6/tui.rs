@@ -62,6 +62,8 @@ pub struct App {
     focus: Panel,
     /// Whether the Upcoming section is visible.
     show_upcoming: bool,
+    /// Whether the errors column is visible in Upcoming.
+    show_errors: bool,
     /// Set to true to signal the render loop to exit.
     quit: bool,
 }
@@ -76,6 +78,7 @@ impl App {
             queue_scroll: 0,
             focus: Panel::Done,
             show_upcoming: true,
+            show_errors: false,
             quit: false,
         }
     }
@@ -114,6 +117,10 @@ impl App {
             }
             KeyCode::Char('u') => {
                 self.show_upcoming = !self.show_upcoming;
+                false
+            }
+            KeyCode::Char('e') => {
+                self.show_errors = !self.show_errors;
                 false
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -600,14 +607,16 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         }
     };
 
+    let show_errors = app.show_errors;
+    let ncols = if show_errors { 4u32 } else { 3u32 };
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-        ])
+        .constraints(
+            (0..ncols)
+                .map(|_| Constraint::Ratio(1, ncols))
+                .collect::<Vec<_>>(),
+        )
         .split(area);
 
     let normal_title = format!(" {} normal ", display::num(status.pending_normal_count));
@@ -639,14 +648,16 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         Style::new().red(),
         Style::new().red().dim(),
     );
-    render_upcoming_block(
-        f,
-        cols[3],
-        &status.pending_errors,
-        &error_title,
-        Style::new().red().dim(),
-        Style::new().red().dim(),
-    );
+    if show_errors {
+        render_upcoming_block(
+            f,
+            cols[3],
+            &status.pending_errors,
+            &error_title,
+            Style::new().red().dim(),
+            Style::new().red().dim(),
+        );
+    }
 }
 
 fn render_upcoming_block(
