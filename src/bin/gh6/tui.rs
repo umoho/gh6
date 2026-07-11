@@ -609,9 +609,9 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let normal_title = format!("{} normal", display::num(status.pending_normal_count));
-    let hub_title = format!("{} hubs", display::num(status.pending_hub_count));
-    let retry_title = format!("{} retries", display::num(status.pending_retry_count));
+    let normal_title = format!(" {} normal ", display::num(status.pending_normal_count));
+    let hub_title = format!(" {} hubs ", display::num(status.pending_hub_count));
+    let retry_title = format!(" {} retries ", display::num(status.pending_retry_count));
 
     render_upcoming_block(
         f,
@@ -655,12 +655,22 @@ fn render_upcoming_block(
     f.render_widget(block, area);
 
     let visible = inner.height as usize;
+    let top_n: Vec<&QueueItem> = items.iter().take(visible).collect();
+
+    // Compute max login width so degrees align vertically.
+    let max_login_w = top_n
+        .iter()
+        .map(|i| UnicodeWidthStr::width(i.login.as_str()))
+        .max()
+        .unwrap_or(0);
+
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible);
 
-    for item in items.iter().take(visible) {
+    for item in &top_n {
         let text = if inner.width >= 10 {
+            let login_s = pad_right(&item.login, max_login_w);
             Line::from(vec![
-                Span::styled(&item.login, item_style),
+                Span::styled(login_s, item_style),
                 Span::styled(format!(" ({}°)", item.degree), Style::new().cyan()),
             ])
         } else {
@@ -672,7 +682,7 @@ fn render_upcoming_block(
         lines.push(text);
     }
 
-    for _ in items.len()..visible {
+    for _ in top_n.len()..visible {
         lines.push(Line::from("—".dim()));
     }
 
