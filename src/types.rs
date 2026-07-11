@@ -130,6 +130,15 @@ pub struct CrawlingWorker {
     pub degree: i32,
 }
 
+/// A single entry in the crawl queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub login: String,
+    pub degree: i32,
+    pub priority: String,
+    pub parent_login: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusData {
     pub users_crawled: u64,
@@ -142,6 +151,14 @@ pub struct StatusData {
     pub uptime_secs: u64,
     pub currently_crawling: Vec<CrawlingWorker>,
     pub paused: bool,
+    /// Queue preview: top entries for each priority group.
+    pub pending_normal: Vec<QueueItem>,
+    pub pending_hub: Vec<QueueItem>,
+    pub pending_retry: Vec<QueueItem>,
+    /// Total counts per priority group (may exceed the preview length).
+    pub pending_normal_count: u64,
+    pub pending_hub_count: u64,
+    pub pending_retry_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,9 +177,12 @@ pub enum CrawlEvent {
         login: String,
         degree: i32,
         new_connections: usize,
+        following_count: i64,
+        followers_count: i64,
     },
     UserQueued {
         login: String,
         degree: i32,
+        parent_login: String,
     },
 }

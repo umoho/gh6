@@ -1,7 +1,13 @@
 //! Terminal UI for `gh6 status tui`.
 //!
-//! Uses ratatui + crossterm to provide a live crawl-monitoring dashboard.
-//! Replaces the old `gh6 status --watch --progress` ANSI escape-code approach.
+//! Uses ratatui + crossterm to provide a live crawl-monitoring dashboard
+//! with five sections:
+//!
+//! 1. Done — completed crawl events (table with FOLLOWING / FOLLOWERS / NEW)
+//! 2. Queue — discovery events (table with VIA)
+//! 3. Upcoming — queue preview (normal | hub | retry columns)
+//! 4. Workers — currently crawling
+//! 5. Stats — counters + API quota
 
 use std::collections::VecDeque;
 use std::io;
@@ -22,24 +28,41 @@ use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
 use crate::display;
-use gh6::types::{CrawlEvent, ServerResponse, StatusData};
+use gh6::types::{CrawlEvent, QueueItem, ServerResponse, StatusData};
 
-/// Maximum number of event lines to keep in memory.
+/// Maximum number of event lines to keep per buffer.
 const MAX_EVENTS: usize = 9999;
 /// Poll interval for keyboard input (milliseconds).
 const TICK_MS: u64 = 100;
+/// Maximum rows for the Done panel.
+const DONE_MAX_ROWS: usize = 15;
+
+// ── Focus ────────────────────────────────────────────────────────────────
+
+/// Which scrollable panel has keyboard focus.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    Done,
+    Queue,
+}
 
 // ── App state ────────────────────────────────────────────────────────────
 
 /// Mutable TUI application state shared between the socket reader and the
 /// render loop via `Arc<Mutex<App>>`.
 pub struct App {
-    /// Ring buffer of crawl events, newest at the back.
-    events: VecDeque<CrawlEvent>,
+    /// Ring buffer of completed crawl events (UserDone), newest at the back.
+    done_events: VecDeque<CrawlEvent>,
+    /// Ring buffer of queued discovery events (UserQueued), newest at the back.
+    queue_events: VecDeque<CrawlEvent>,
     /// Latest status snapshot (replaced on each `Ok` response).
     status: Option<StatusData>,
-    /// How many lines we have scrolled back from the bottom (0 = at bottom).
-    scroll: usize,
+    /// Scroll offset for Done panel (0 = bottom, larger = scrolled up).
+    done_scroll: usize,
+    /// Scroll offset for Queue panel.
+    queue_scroll: usize,
+    /// Which panel receives keyboard input.
+    focus: Panel,
     /// Set to true to signal the render loop to exit.
     quit: bool,
 }
@@ -47,19 +70,28 @@ pub struct App {
 impl App {
     fn new() -> Self {
         Self {
-            events: VecDeque::with_capacity(MAX_EVENTS),
+            done_events: VecDeque::with_capacity(MAX_EVENTS),
+            queue_events: VecDeque::with_capacity(MAX_EVENTS),
             status: None,
-            scroll: 0,
+            done_scroll: 0,
+            queue_scroll: 0,
+            focus: Panel::Done,
             quit: false,
         }
     }
 
-    /// Push a new event, evicting the oldest if at capacity.
-    fn push_event(&mut self, event: CrawlEvent) {
-        if self.events.len() >= MAX_EVENTS {
-            self.events.pop_front();
+    fn push_done(&mut self, event: CrawlEvent) {
+        if self.done_events.len() >= MAX_EVENTS {
+            self.done_events.pop_front();
         }
-        self.events.push_back(event);
+        self.done_events.push_back(event);
+    }
+
+    fn push_queue(&mut self, event: CrawlEvent) {
+        if self.queue_events.len() >= MAX_EVENTS {
+            self.queue_events.pop_front();
+        }
+        self.queue_events.push_back(event);
     }
 
     fn update_status(&mut self, s: StatusData) {
@@ -73,34 +105,74 @@ impl App {
                 self.quit = true;
                 true
             }
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Panel::Done => Panel::Queue,
+                    Panel::Queue => Panel::Done,
+                };
+                false
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.scroll > 0 {
-                    self.scroll -= 1;
+                match self.focus {
+                    Panel::Done if self.done_scroll > 0 => self.done_scroll -= 1,
+                    Panel::Queue if self.queue_scroll > 0 => self.queue_scroll -= 1,
+                    _ => {}
                 }
                 false
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                let max = self.events.len().saturating_sub(1);
-                if self.scroll < max {
-                    self.scroll += 1;
+                match self.focus {
+                    Panel::Done => {
+                        let max = self.done_events.len().saturating_sub(1);
+                        if self.done_scroll < max {
+                            self.done_scroll += 1;
+                        }
+                    }
+                    Panel::Queue => {
+                        let max = self.queue_events.len().saturating_sub(1);
+                        if self.queue_scroll < max {
+                            self.queue_scroll += 1;
+                        }
+                    }
                 }
                 false
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
+                match self.focus {
+                    Panel::Done => self.done_scroll = self.done_scroll.saturating_sub(10),
+                    Panel::Queue => self.queue_scroll = self.queue_scroll.saturating_sub(10),
+                }
                 false
             }
             KeyCode::PageUp => {
-                let max = self.events.len().saturating_sub(1);
-                self.scroll = (self.scroll + 10).min(max);
+                match self.focus {
+                    Panel::Done => {
+                        let max = self.done_events.len().saturating_sub(1);
+                        self.done_scroll = (self.done_scroll + 10).min(max);
+                    }
+                    Panel::Queue => {
+                        let max = self.queue_events.len().saturating_sub(1);
+                        self.queue_scroll = (self.queue_scroll + 10).min(max);
+                    }
+                }
                 false
             }
             KeyCode::Char('g') => {
-                self.scroll = self.events.len().saturating_sub(1);
+                match self.focus {
+                    Panel::Done => {
+                        self.done_scroll = self.done_events.len().saturating_sub(1);
+                    }
+                    Panel::Queue => {
+                        self.queue_scroll = self.queue_events.len().saturating_sub(1);
+                    }
+                }
                 false
             }
             KeyCode::Char('G') => {
-                self.scroll = 0;
+                match self.focus {
+                    Panel::Done => self.done_scroll = 0,
+                    Panel::Queue => self.queue_scroll = 0,
+                }
                 false
             }
             _ => false,
@@ -155,7 +227,6 @@ pub async fn run(socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
                 Err(_) => break,
             }
         }
-        // Socket closed or errored — signal quit.
         let mut app = app_reader.lock().unwrap();
         app.quit = true;
     });
@@ -177,18 +248,28 @@ fn handle_response(app: &mut App, resp: ServerResponse) {
                 app.update_status(s);
             }
         }
-        ServerResponse::Event { data } => {
-            app.push_event(data);
-            // When viewing history, maintain relative scroll position.
-            if app.scroll > 0 {
-                app.scroll += 1;
-                // Cap at buffer length.
-                let max = app.events.len().saturating_sub(1);
-                if app.scroll > max {
-                    app.scroll = max;
+        ServerResponse::Event { data } => match &data {
+            CrawlEvent::UserDone { .. } => {
+                app.push_done(data);
+                if app.done_scroll > 0 {
+                    app.done_scroll += 1;
+                    let max = app.done_events.len().saturating_sub(1);
+                    if app.done_scroll > max {
+                        app.done_scroll = max;
+                    }
                 }
             }
-        }
+            CrawlEvent::UserQueued { .. } => {
+                app.push_queue(data);
+                if app.queue_scroll > 0 {
+                    app.queue_scroll += 1;
+                    let max = app.queue_events.len().saturating_sub(1);
+                    if app.queue_scroll > max {
+                        app.queue_scroll = max;
+                    }
+                }
+            }
+        },
         ServerResponse::Bye => {
             app.quit = true;
         }
@@ -203,7 +284,6 @@ fn run_loop(
     app: &Arc<Mutex<App>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        // Draw — release the lock before polling for input.
         let quit;
         {
             let app = app.lock().unwrap();
@@ -214,12 +294,9 @@ fn run_loop(
             return Ok(());
         }
 
-        // Wait for keyboard input with a short timeout so we redraw
-        // regularly even when nothing happens.
         if event::poll(Duration::from_millis(TICK_MS))?
             && let Event::Key(key) = event::read()?
         {
-            // Ctrl+C → quit.
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(());
             }
@@ -234,90 +311,337 @@ fn run_loop(
 // ── Layout ───────────────────────────────────────────────────────────────
 
 fn render(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let total_h = area.height as usize;
+
+    // Fixed regions: upcoming(6) + workers(1) + stats(1) = 8
+    let fixed = 8usize;
+    let flex = total_h.saturating_sub(fixed);
+
+    // Done gets at most DONE_MAX_ROWS (header + data), queue gets the rest.
+    let done_rows = (app.done_events.len() + 1).min(DONE_MAX_ROWS);
+    let done_h = done_rows.min(flex.saturating_sub(1));
+    let queue_h = flex.saturating_sub(done_h);
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),    // event log — takes remaining space
-            Constraint::Length(1), // workers line
-            Constraint::Length(1), // stats line
+            Constraint::Length(done_h as u16),
+            Constraint::Length(queue_h.max(1) as u16),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
-        .split(f.area());
+        .split(area);
 
-    render_events(f, layout[0], app);
-    render_workers(f, layout[1], app);
-    render_stats(f, layout[2], app);
+    // Compute shared DEG / LOGIN column widths across both tables.
+    let (deg_w, login_w) = shared_col_widths(app);
+
+    render_done(f, layout[0], app, deg_w, login_w);
+    render_queue(f, layout[1], app, deg_w, login_w);
+    render_upcoming(f, layout[2], app);
+    render_workers(f, layout[3], app);
+    render_stats(f, layout[4], app);
 }
 
-// ── Event log ────────────────────────────────────────────────────────────
+// ── Shared column widths ─────────────────────────────────────────────────
 
-fn render_events(f: &mut Frame, area: Rect, app: &App) {
-    let visible = area.height as usize;
-    if visible == 0 {
+/// Compute the maximum DEG and LOGIN display widths across all visible
+/// Done and Queue events, so columns align in both panels.
+fn shared_col_widths(app: &App) -> (usize, usize) {
+    let mut max_deg = 2; // minimum "N°"
+    let mut max_login = 0;
+
+    for event in app.done_events.iter().chain(app.queue_events.iter()) {
+        let (degree, login) = match event {
+            CrawlEvent::UserDone { login, degree, .. }
+            | CrawlEvent::UserQueued { login, degree, .. } => (*degree, login.as_str()),
+        };
+        let deg_s = format!("{degree}°");
+        max_deg = max_deg.max(UnicodeWidthStr::width(deg_s.as_str()));
+        max_login = max_login.max(UnicodeWidthStr::width(login));
+    }
+    (max_deg, max_login)
+}
+
+// ── Done panel ───────────────────────────────────────────────────────────
+
+fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usize) {
+    if area.height == 0 {
         return;
     }
+    let term_w = area.width as usize;
 
-    let total = app.events.len();
-    let end = total.saturating_sub(app.scroll);
-    let start = end.saturating_sub(visible);
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+
+    // Header
+    lines.push(done_header(deg_w, login_w, term_w));
+
+    // Data rows (bottom-aligned in the remaining space)
+    let data_h = area.height.saturating_sub(1) as usize;
+    let total = app.done_events.len();
+    let end = total.saturating_sub(app.done_scroll);
+    let start = end.saturating_sub(data_h);
     let count = end - start;
-
-    let width = area.width as usize;
-
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible);
-
-    // Pad top so events are bottom-aligned when there are fewer than
-    // the visible area (matching the natural scroll-up feel).
-    let top_pad = visible.saturating_sub(count);
+    let top_pad = data_h.saturating_sub(count);
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
-
-    for event in app.events.iter().skip(start).take(count) {
-        lines.push(format_event_line(event, width));
-    }
-
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-/// Build one coloured event line with left (degree + login) and
-/// right (status) parts, padded with spaces to fill `term_width`.
-fn format_event_line(event: &CrawlEvent, term_width: usize) -> Line<'static> {
-    match event {
-        CrawlEvent::UserDone {
+    for event in app.done_events.iter().skip(start).take(count) {
+        if let CrawlEvent::UserDone {
             login,
             degree,
             new_connections,
-        } => {
-            let left = format!("[{}°] {}", degree, login);
-            let left_w = UnicodeWidthStr::width(left.as_str());
-            let right = format!("done  +{} connections", new_connections);
-            let right_w = UnicodeWidthStr::width(right.as_str());
-            let pad = term_width.saturating_sub(left_w + right_w).max(1);
-
-            Line::from(vec![
-                Span::styled(format!("[{}°]", degree), Style::new().cyan()),
-                Span::raw(" "),
-                Span::styled(login.clone(), Style::new().blue()),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(right, Style::new().green()),
-            ])
-        }
-        CrawlEvent::UserQueued { login, degree } => {
-            let left = format!("[{}°] {}", degree, login);
-            let left_w = UnicodeWidthStr::width(left.as_str());
-            let right = "queued";
-            let right_w = UnicodeWidthStr::width(right);
-            let pad = term_width.saturating_sub(left_w + right_w).max(1);
-
-            Line::from(vec![
-                Span::styled(format!("[{}°]", degree), Style::new().cyan()),
-                Span::raw(" "),
-                Span::styled(login.clone(), Style::new().blue()),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(right.to_string(), Style::new().dim()),
-            ])
+            following_count,
+            followers_count,
+        } = event
+        {
+            lines.push(format_done_line(&DoneFmt {
+                degree: *degree,
+                login,
+                new_connections: *new_connections,
+                following_count: *following_count,
+                followers_count: *followers_count,
+                deg_w,
+                login_w,
+                term_w,
+            }));
         }
     }
+
+    // Focus indicator
+    let style = if app.focus == Panel::Done {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
+
+    f.render_widget(Paragraph::new(lines).style(style), area);
+}
+
+fn done_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
+    let h_deg = pad_right("DEG", deg_w);
+    let h_login = pad_right("LOGIN", login_w);
+    let h_following = "FOLLOWING";
+    let h_followers = "FOLLOWERS";
+    let h_new = "NEW";
+
+    let line_str = if term_w >= 40 {
+        format!("  {h_deg}  {h_login}  {h_following}  {h_followers}  {h_new}")
+    } else {
+        format!("  {h_deg}  {h_login}  {h_new}")
+    };
+
+    Line::from(line_str.dim().bold())
+}
+
+/// Layout parameters for formatting a done-line row.
+struct DoneFmt<'a> {
+    degree: i32,
+    login: &'a str,
+    new_connections: usize,
+    following_count: i64,
+    followers_count: i64,
+    deg_w: usize,
+    login_w: usize,
+    term_w: usize,
+}
+
+fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
+    let deg_s = pad_left(&format!("{}°", cfg.degree), cfg.deg_w);
+    let login_s = pad_right(cfg.login, cfg.login_w);
+    let following_s = display::num(cfg.following_count as u64);
+    let followers_s = display::num(cfg.followers_count as u64);
+    let new_s = format!("+{}", cfg.new_connections);
+
+    let spans = if cfg.term_w >= 40 {
+        vec![
+            Span::raw("  "),
+            Span::styled(deg_s, Style::new().cyan()),
+            Span::raw("  "),
+            Span::styled(login_s, Style::new().blue()),
+            Span::raw("  "),
+            Span::styled(pad_left(&following_s, 9), Style::new().dim()),
+            Span::raw("  "),
+            Span::styled(pad_left(&followers_s, 9), Style::new().dim()),
+            Span::raw("  "),
+            Span::styled(new_s, Style::new().green()),
+        ]
+    } else {
+        vec![
+            Span::raw("  "),
+            Span::styled(deg_s, Style::new().cyan()),
+            Span::raw("  "),
+            Span::styled(login_s, Style::new().blue()),
+            Span::raw("  "),
+            Span::styled(new_s, Style::new().green()),
+        ]
+    };
+
+    Line::from(spans)
+}
+
+// ── Queue panel ──────────────────────────────────────────────────────────
+
+fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usize) {
+    if area.height == 0 {
+        return;
+    }
+    let term_w = area.width as usize;
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+
+    // Header
+    lines.push(queue_header(deg_w, login_w, term_w));
+
+    // Data rows
+    let data_h = area.height.saturating_sub(1) as usize;
+    let total = app.queue_events.len();
+    let end = total.saturating_sub(app.queue_scroll);
+    let start = end.saturating_sub(data_h);
+    let count = end - start;
+    let top_pad = data_h.saturating_sub(count);
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    for event in app.queue_events.iter().skip(start).take(count) {
+        if let CrawlEvent::UserQueued {
+            login,
+            degree,
+            parent_login,
+        } = event
+        {
+            lines.push(format_queue_line(
+                *degree,
+                login,
+                parent_login,
+                deg_w,
+                login_w,
+                term_w,
+            ));
+        }
+    }
+
+    let style = if app.focus == Panel::Queue {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
+
+    f.render_widget(Paragraph::new(lines).style(style), area);
+}
+
+fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
+    let h_deg = pad_right("DEG", deg_w);
+    let h_login = pad_right("LOGIN", login_w);
+    let h_via = "VIA";
+    let line_str = format!("  {h_deg}  {h_login}  {h_via}");
+    let _ = term_w;
+    Line::from(line_str.dim().bold())
+}
+
+fn format_queue_line(
+    degree: i32,
+    login: &str,
+    parent_login: &str,
+    deg_w: usize,
+    login_w: usize,
+    _term_w: usize,
+) -> Line<'static> {
+    let deg_s = pad_left(&format!("{degree}°"), deg_w);
+    let login_s = pad_right(login, login_w);
+    let via_s = format!("via {parent_login}");
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(deg_s, Style::new().cyan()),
+        Span::raw("  "),
+        Span::styled(login_s, Style::new().blue()),
+        Span::raw("  "),
+        Span::styled(via_s, Style::new().dim()),
+    ])
+}
+
+// ── Upcoming panel ───────────────────────────────────────────────────────
+
+fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
+    let status = match &app.status {
+        Some(s) => s,
+        None => {
+            f.render_widget(Paragraph::new("connecting...".dim()), area);
+            return;
+        }
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+
+    // Title row
+    let title = Line::from(vec![
+        "  准备列  ".dim(),
+        Span::styled(
+            format!("normal:{}", status.pending_normal_count),
+            Style::new().green(),
+        ),
+        "  ".dim(),
+        Span::styled(
+            format!("hub:{}", status.pending_hub_count),
+            Style::new().yellow(),
+        ),
+        "  ".dim(),
+        Span::styled(
+            format!("retry:{}", status.pending_retry_count),
+            Style::new().red(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(title), chunks[0]);
+
+    // Three-column body: normal | hub | retry
+    let body_area = chunks[1];
+    let col_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(body_area);
+
+    render_upcoming_col(f, col_chunks[0], &status.pending_normal, "normal");
+    render_upcoming_col(f, col_chunks[1], &status.pending_hub, "hub");
+    render_upcoming_col(f, col_chunks[2], &status.pending_retry, "retry");
+}
+
+fn render_upcoming_col(f: &mut Frame, area: Rect, items: &[QueueItem], _label: &str) {
+    let visible = area.height as usize;
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible);
+
+    for item in items.iter().take(visible) {
+        let text = if area.width >= 12 {
+            format!("{} ({}°)", item.login, item.degree)
+        } else {
+            display::truncate_str(&item.login, area.width as usize)
+        };
+
+        let style = match item.priority.as_str() {
+            "normal" => Style::new(),
+            "low" => Style::new().yellow(),
+            "retry" => Style::new().red(),
+            _ => Style::new(),
+        };
+
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    // Fill remaining with "—"
+    let remaining = visible.saturating_sub(items.len());
+    for _ in 0..remaining {
+        lines.push(Line::from("—".dim()));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 // ── Workers line ─────────────────────────────────────────────────────────
@@ -352,7 +676,6 @@ fn render_workers(f: &mut Frame, area: Rect, app: &App) {
     let total = status.currently_crawling.len();
     let overflow = total.saturating_sub(max_show);
 
-    // Build the full line text first so we can measure its width.
     let mut text = String::from("crawling ");
     for (i, w) in status.currently_crawling.iter().take(max_show).enumerate() {
         if i > 0 {
@@ -366,7 +689,6 @@ fn render_workers(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if UnicodeWidthStr::width(text.as_str()) <= term_width {
-        // Fits — render with full styling.
         let mut spans: Vec<Span<'_>> = vec![Span::styled("crawling ", Style::new().dim())];
         for (i, w) in status.currently_crawling.iter().take(max_show).enumerate() {
             if i > 0 {
@@ -386,7 +708,6 @@ fn render_workers(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
-        // Too wide — fall back to compact comma-separated form.
         let logins: Vec<String> = status
             .currently_crawling
             .iter()
@@ -451,4 +772,26 @@ fn render_stats(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(api_str, api_style),
     ]);
     f.render_widget(Paragraph::new(right).alignment(Alignment::Right), chunks[1]);
+}
+
+// ── Padding helpers ──────────────────────────────────────────────────────
+
+/// Right-pad a string to `width` display columns.
+fn pad_right(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - w))
+    }
+}
+
+/// Left-pad a string to `width` display columns.
+fn pad_left(s: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", " ".repeat(width - w), s)
+    }
 }

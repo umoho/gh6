@@ -520,6 +520,8 @@ async fn crawl_loop(
                     login: scope.clone(),
                     degree,
                     new_connections: new_edges_count,
+                    following_count,
+                    followers_count,
                 });
 
                 // Only send UserQueued for logins that were actually added
@@ -529,6 +531,7 @@ async fn crawl_loop(
                     let _ = state.event_tx.send(CrawlEvent::UserQueued {
                         login: login.clone(),
                         degree: next_degree,
+                        parent_login: scope.clone(),
                     });
                 }
 
@@ -761,6 +764,13 @@ fn build_status_data(
     let uptime_secs = state.started_at.elapsed().as_secs();
     let paused = state.paused.load(Ordering::SeqCst);
 
+    let queue_limit = 5;
+    let (pending_normal, pending_hub, pending_retry) =
+        db.queue_preview(crawler_name, queue_limit)?;
+    let pending_normal_count = db.get_pending_count_by_priority(crawler_name, "normal")?;
+    let pending_hub_count = db.get_pending_count_by_priority(crawler_name, "low")?;
+    let pending_retry_count = users_retry;
+
     Ok(StatusData {
         users_crawled,
         users_queued,
@@ -772,5 +782,11 @@ fn build_status_data(
         uptime_secs,
         currently_crawling: currently_crawling.into_iter().flatten().collect(),
         paused,
+        pending_normal,
+        pending_hub,
+        pending_retry,
+        pending_normal_count,
+        pending_hub_count,
+        pending_retry_count,
     })
 }

@@ -2,7 +2,7 @@ use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::types::{DegreeDist, Edge, GithubUserProfile, NewEdge, User};
+use crate::types::{DegreeDist, Edge, GithubUserProfile, NewEdge, QueueItem, User};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -16,6 +16,9 @@ pub enum DbError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Queue preview triple: (normal, hub, retry).
+type QueuePreview = (Vec<QueueItem>, Vec<QueueItem>, Vec<QueueItem>);
 
 // ---------------------------------------------------------------------------
 // Db struct
@@ -675,6 +678,83 @@ impl Db {
             params![crawler_name, scope_key, degree, priority],
         )?;
         Ok(())
+    }
+
+    /// Return queue preview: top N entries for each priority group.
+    pub fn queue_preview(
+        &self,
+        crawler_name: &str,
+        limit: usize,
+    ) -> Result<QueuePreview, DbError> {
+        let normal = self.queue_items_by_priority(crawler_name, "normal", "pending", limit)?;
+        let hub = self.queue_items_by_priority(crawler_name, "low", "pending", limit)?;
+        let retry = self.queue_items_retry(crawler_name, limit)?;
+        Ok((normal, hub, retry))
+    }
+
+    /// Count pending scopes for a given priority.
+    pub fn get_pending_count_by_priority(
+        &self,
+        crawler_name: &str,
+        priority: &str,
+    ) -> Result<u64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM crawl_state WHERE crawler_name = ?1 AND priority = ?2 AND status = 'pending'",
+            params![crawler_name, priority],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    fn queue_items_by_priority(
+        &self,
+        crawler_name: &str,
+        priority: &str,
+        status: &str,
+        limit: usize,
+    ) -> Result<Vec<QueueItem>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_key, degree FROM crawl_state \
+             WHERE crawler_name = ?1 AND priority = ?2 AND status = ?3 \
+             ORDER BY rowid ASC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![crawler_name, priority, status, limit as i64],
+                |row| {
+                    Ok(QueueItem {
+                        login: row.get(0)?,
+                        degree: row.get(1)?,
+                        priority: priority.to_string(),
+                        parent_login: None,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn queue_items_retry(
+        &self,
+        crawler_name: &str,
+        limit: usize,
+    ) -> Result<Vec<QueueItem>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_key, degree FROM crawl_state \
+             WHERE crawler_name = ?1 AND status = 'retry' \
+             ORDER BY error_count ASC, rowid ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![crawler_name, limit as i64], |row| {
+                Ok(QueueItem {
+                    login: row.get(0)?,
+                    degree: row.get(1)?,
+                    priority: "retry".to_string(),
+                    parent_login: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Check whether a crawl state record exists for the given crawler + scope.
