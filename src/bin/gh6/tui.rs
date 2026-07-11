@@ -349,7 +349,7 @@ fn render(f: &mut Frame, app: &App) {
 /// Compute the maximum DEG and LOGIN display widths across all visible
 /// Done and Queue events, so columns align in both panels.
 fn shared_col_widths(app: &App) -> (usize, usize) {
-    let mut max_deg = 2; // minimum "N°"
+    let mut max_deg = 3; // minimum width for "DEG" column header
     let mut max_login = 0;
 
     for event in app.done_events.iter().chain(app.queue_events.iter()) {
@@ -423,9 +423,9 @@ fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usiz
 fn done_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
     let left_w = deg_w + 2 + login_w;
     let fw = 9usize;
-    let new_w = 3usize;
+    let new_w = 5usize;
     let right_w = fw + 2 + fw + 2 + new_w;
-    let gap = term_w.saturating_sub(left_w + right_w + 1).max(1);
+    let gap = term_w.saturating_sub(left_w + right_w).max(1);
 
     Line::from(vec![
         Span::styled(pad_right("DEG", deg_w), Style::new().dim().bold()),
@@ -462,7 +462,7 @@ struct DoneFmt<'a> {
 }
 
 fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
-    let deg_s = pad_left(&format!("{}°", cfg.degree), cfg.deg_w);
+    let deg_s = pad_right(&format!("{}°", cfg.degree), cfg.deg_w);
     let login_s = pad_right(cfg.login, cfg.login_w);
     let left_w = cfg.deg_w + 2 + cfg.login_w;
 
@@ -471,9 +471,9 @@ fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
     let new_s = format!("+{}", cfg.new_connections);
 
     let fw = 9usize;
-    let new_w = UnicodeWidthStr::width(new_s.as_str());
+    let new_w = 5usize;
     let right_w = fw + 2 + fw + 2 + new_w;
-    let gap = cfg.term_w.saturating_sub(left_w + right_w + 1).max(1);
+    let gap = cfg.term_w.saturating_sub(left_w + right_w).max(1);
 
     Line::from(vec![
         Span::styled(deg_s, Style::new().cyan()),
@@ -484,7 +484,10 @@ fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(format!("{:>fw$}", followers_s, fw = fw), Style::new().dim()),
         Span::raw("  "),
-        Span::styled(new_s, Style::new().green()),
+        Span::styled(
+            format!("{:>new_w$}", new_s, new_w = new_w),
+            Style::new().green(),
+        ),
     ])
 }
 
@@ -541,7 +544,7 @@ fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usi
 fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
     let left_w = deg_w + 2 + login_w;
     let via_w = 3usize;
-    let gap = term_w.saturating_sub(left_w + via_w + 1).max(1);
+    let gap = term_w.saturating_sub(left_w + via_w).max(1);
 
     Line::from(vec![
         Span::styled(pad_right("DEG", deg_w), Style::new().dim().bold()),
@@ -560,12 +563,12 @@ fn format_queue_line(
     login_w: usize,
     term_w: usize,
 ) -> Line<'static> {
-    let deg_s = pad_left(&format!("{}°", degree), deg_w);
+    let deg_s = pad_right(&format!("{}°", degree), deg_w);
     let login_s = pad_right(login, login_w);
     let left_w = deg_w + 2 + login_w;
 
     let via_w = UnicodeWidthStr::width(parent_login);
-    let gap = term_w.saturating_sub(left_w + via_w + 1).max(1);
+    let gap = term_w.saturating_sub(left_w + via_w).max(1);
 
     Line::from(vec![
         Span::styled(deg_s, Style::new().cyan()),
@@ -807,15 +810,5 @@ fn pad_right(s: &str, width: usize) -> String {
         s.to_string()
     } else {
         format!("{}{}", s, " ".repeat(width - w))
-    }
-}
-
-/// Left-pad a string to `width` display columns.
-fn pad_left(s: &str, width: usize) -> String {
-    let w = UnicodeWidthStr::width(s);
-    if w >= width {
-        s.to_string()
-    } else {
-        format!("{}{}", " ".repeat(width - w), s)
     }
 }
