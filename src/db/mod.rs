@@ -681,11 +681,7 @@ impl Db {
     }
 
     /// Return queue preview: top N entries for each priority group.
-    pub fn queue_preview(
-        &self,
-        crawler_name: &str,
-        limit: usize,
-    ) -> Result<QueuePreview, DbError> {
+    pub fn queue_preview(&self, crawler_name: &str, limit: usize) -> Result<QueuePreview, DbError> {
         let normal = self.queue_items_by_priority(crawler_name, "normal", "pending", limit)?;
         let hub = self.queue_items_by_priority(crawler_name, "low", "pending", limit)?;
         let retry = self.queue_items_retry(crawler_name, limit)?;

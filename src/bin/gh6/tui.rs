@@ -420,18 +420,26 @@ fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usiz
 }
 
 fn done_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
-    let h_deg = pad_right("DEG", deg_w);
-    let h_login = pad_right("LOGIN", login_w);
-    let h_following = "FOLLOWING";
-    let h_followers = "FOLLOWERS";
-    let h_new = "NEW";
+    let left = format!(
+        "  {}  {}",
+        pad_right("DEG", deg_w),
+        pad_right("LOGIN", login_w)
+    );
+    let left_w = 2 + deg_w + 2 + login_w;
+    let fw = 9usize;
+    let new_w = 3usize; // "NEW"
+    let right_w = fw + 2 + fw + 2 + new_w;
+    let gap = term_w.saturating_sub(left_w + right_w).max(1);
 
-    let line_str = if term_w >= 40 {
-        format!("  {h_deg}  {h_login}  {h_following}  {h_followers}  {h_new}")
-    } else {
-        format!("  {h_deg}  {h_login}  {h_new}")
-    };
-
+    let line_str = format!(
+        "{left}{}  {:>fw$}  {:>fw$}  {:>new_w$}",
+        " ".repeat(gap),
+        "FOLLOWING",
+        "FOLLOWERS",
+        "NEW",
+        fw = fw,
+        new_w = new_w,
+    );
     Line::from(line_str.dim().bold())
 }
 
@@ -450,35 +458,29 @@ struct DoneFmt<'a> {
 fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
     let deg_s = pad_left(&format!("{}°", cfg.degree), cfg.deg_w);
     let login_s = pad_right(cfg.login, cfg.login_w);
+    let left_w = 2 + cfg.deg_w + 2 + cfg.login_w;
+
     let following_s = display::num(cfg.following_count as u64);
     let followers_s = display::num(cfg.followers_count as u64);
     let new_s = format!("+{}", cfg.new_connections);
 
-    let spans = if cfg.term_w >= 40 {
-        vec![
-            Span::raw("  "),
-            Span::styled(deg_s, Style::new().cyan()),
-            Span::raw("  "),
-            Span::styled(login_s, Style::new().blue()),
-            Span::raw("  "),
-            Span::styled(pad_left(&following_s, 9), Style::new().dim()),
-            Span::raw("  "),
-            Span::styled(pad_left(&followers_s, 9), Style::new().dim()),
-            Span::raw("  "),
-            Span::styled(new_s, Style::new().green()),
-        ]
-    } else {
-        vec![
-            Span::raw("  "),
-            Span::styled(deg_s, Style::new().cyan()),
-            Span::raw("  "),
-            Span::styled(login_s, Style::new().blue()),
-            Span::raw("  "),
-            Span::styled(new_s, Style::new().green()),
-        ]
-    };
+    let fw = 9usize;
+    let new_w = UnicodeWidthStr::width(new_s.as_str());
+    let right_w = fw + 2 + fw + 2 + new_w;
+    let gap = cfg.term_w.saturating_sub(left_w + right_w).max(1);
 
-    Line::from(spans)
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(deg_s, Style::new().cyan()),
+        Span::raw("  "),
+        Span::styled(login_s, Style::new().blue()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(format!("{:>fw$}", following_s, fw = fw), Style::new().dim()),
+        Span::raw("  "),
+        Span::styled(format!("{:>fw$}", followers_s, fw = fw), Style::new().dim()),
+        Span::raw("  "),
+        Span::styled(new_s, Style::new().green()),
+    ])
 }
 
 // ── Queue panel ──────────────────────────────────────────────────────────
@@ -532,11 +534,17 @@ fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usi
 }
 
 fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
-    let h_deg = pad_right("DEG", deg_w);
-    let h_login = pad_right("LOGIN", login_w);
-    let h_via = "VIA";
-    let line_str = format!("  {h_deg}  {h_login}  {h_via}");
-    let _ = term_w;
+    let left = format!(
+        "  {}  {}",
+        pad_right("DEG", deg_w),
+        pad_right("LOGIN", login_w)
+    );
+    let left_w = 2 + deg_w + 2 + login_w;
+    let via_w = 3usize;
+    let right_w = via_w;
+    let gap = term_w.saturating_sub(left_w + right_w).max(1);
+
+    let line_str = format!("{left}{}VIA", " ".repeat(gap),);
     Line::from(line_str.dim().bold())
 }
 
@@ -546,18 +554,22 @@ fn format_queue_line(
     parent_login: &str,
     deg_w: usize,
     login_w: usize,
-    _term_w: usize,
+    term_w: usize,
 ) -> Line<'static> {
-    let deg_s = pad_left(&format!("{degree}°"), deg_w);
+    let deg_s = pad_left(&format!("{}°", degree), deg_w);
     let login_s = pad_right(login, login_w);
+    let left_w = 2 + deg_w + 2 + login_w;
+
     let via_s = format!("via {parent_login}");
+    let via_w = UnicodeWidthStr::width(via_s.as_str());
+    let gap = term_w.saturating_sub(left_w + via_w).max(1);
 
     Line::from(vec![
         Span::raw("  "),
         Span::styled(deg_s, Style::new().cyan()),
         Span::raw("  "),
         Span::styled(login_s, Style::new().blue()),
-        Span::raw("  "),
+        Span::raw(" ".repeat(gap)),
         Span::styled(via_s, Style::new().dim()),
     ])
 }
@@ -580,7 +592,7 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
 
     // Title row
     let title = Line::from(vec![
-        "  准备列  ".dim(),
+        "  Upcoming  ".dim(),
         Span::styled(
             format!("normal:{}", status.pending_normal_count),
             Style::new().green(),
