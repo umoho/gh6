@@ -600,85 +600,83 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
         ])
         .split(area);
 
-    // Row 0: title
-    f.render_widget(Paragraph::new("  Upcoming".dim()), chunks[0]);
+    let normal_title = format!("{} normal", display::num(status.pending_normal_count));
+    let hub_title = format!("{} hubs", display::num(status.pending_hub_count));
+    let retry_title = format!("{} retries", display::num(status.pending_retry_count));
 
-    // Row 1: column labels aligned with the three data columns
-    let hdr_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
-        .split(chunks[1]);
-
-    f.render_widget(
-        Paragraph::new(format!("normal:{}", status.pending_normal_count).green()),
-        hdr_cols[0],
+    render_upcoming_block(
+        f,
+        cols[0],
+        &status.pending_normal,
+        &normal_title,
+        Style::new().green(),
+        Style::new().green().dim(),
     );
-    f.render_widget(
-        Paragraph::new(format!("hub:{}", status.pending_hub_count).yellow()),
-        hdr_cols[1],
+    render_upcoming_block(
+        f,
+        cols[1],
+        &status.pending_hub,
+        &hub_title,
+        Style::new().yellow(),
+        Style::new().yellow().dim(),
     );
-    f.render_widget(
-        Paragraph::new(format!("retry:{}", status.pending_retry_count).red()),
-        hdr_cols[2],
+    render_upcoming_block(
+        f,
+        cols[2],
+        &status.pending_retry,
+        &retry_title,
+        Style::new().red(),
+        Style::new().red().dim(),
     );
-
-    // Rows 2-6: data columns
-    let body_area = chunks[2];
-    let col_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
-        .split(body_area);
-
-    render_upcoming_col(f, col_chunks[0], &status.pending_normal);
-    render_upcoming_col(f, col_chunks[1], &status.pending_hub);
-    render_upcoming_col(f, col_chunks[2], &status.pending_retry);
 }
 
-fn render_upcoming_col(f: &mut Frame, area: Rect, items: &[QueueItem]) {
-    let visible = area.height as usize;
+fn render_upcoming_block(
+    f: &mut Frame,
+    area: Rect,
+    items: &[QueueItem],
+    title: &str,
+    item_style: Style,
+    title_style: Style,
+) {
+    let block = Block::bordered()
+        .title(title)
+        .title_style(title_style)
+        .border_style(Style::new().dim());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible);
 
     for item in items.iter().take(visible) {
-        let text = if area.width >= 12 {
-            format!("{} ({}°)", item.login, item.degree)
+        let text = if inner.width >= 10 {
+            Line::from(vec![
+                Span::styled(&item.login, item_style),
+                Span::styled(format!(" ({}°)", item.degree), Style::new().cyan()),
+            ])
         } else {
-            display::truncate_str(&item.login, area.width as usize)
+            Line::from(Span::styled(
+                display::truncate_str(&item.login, inner.width as usize),
+                item_style,
+            ))
         };
-
-        let style = match item.priority.as_str() {
-            "normal" => Style::new(),
-            "low" => Style::new().yellow(),
-            "retry" => Style::new().red(),
-            _ => Style::new(),
-        };
-
-        lines.push(Line::from(Span::styled(text, style)));
+        lines.push(text);
     }
 
-    // Fill remaining with "—"
-    let remaining = visible.saturating_sub(items.len());
-    for _ in 0..remaining {
+    for _ in items.len()..visible {
         lines.push(Line::from("—".dim()));
     }
 
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Workers line ─────────────────────────────────────────────────────────
