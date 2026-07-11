@@ -767,9 +767,11 @@ fn build_status_data(
     let queue_limit = 5;
     let (pending_normal, pending_hub, pending_retry) =
         db.queue_preview(crawler_name, queue_limit)?;
+    let pending_errors = db.error_preview(crawler_name, queue_limit)?;
     let pending_normal_count = db.get_pending_count_by_priority(crawler_name, "normal")?;
     let pending_hub_count = db.get_pending_count_by_priority(crawler_name, "low")?;
     let pending_retry_count = users_retry;
+    let pending_errors_count = users_error;
 
     Ok(StatusData {
         users_crawled,
@@ -785,8 +787,10 @@ fn build_status_data(
         pending_normal,
         pending_hub,
         pending_retry,
+        pending_errors,
         pending_normal_count,
         pending_hub_count,
         pending_retry_count,
+        pending_errors_count,
     })
 }

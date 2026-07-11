@@ -155,10 +155,12 @@ pub struct StatusData {
     pub pending_normal: Vec<QueueItem>,
     pub pending_hub: Vec<QueueItem>,
     pub pending_retry: Vec<QueueItem>,
+    pub pending_errors: Vec<QueueItem>,
     /// Total counts per priority group (may exceed the preview length).
     pub pending_normal_count: u64,
     pub pending_hub_count: u64,
     pub pending_retry_count: u64,
+    pub pending_errors_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

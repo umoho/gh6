@@ -688,6 +688,15 @@ impl Db {
         Ok((normal, hub, retry))
     }
 
+    /// Return top N permanently errored scopes.
+    pub fn error_preview(
+        &self,
+        crawler_name: &str,
+        limit: usize,
+    ) -> Result<Vec<QueueItem>, DbError> {
+        self.queue_items_error(crawler_name, limit)
+    }
+
     /// Count pending scopes for a given priority.
     pub fn get_pending_count_by_priority(
         &self,
@@ -712,7 +721,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT scope_key, degree FROM crawl_state \
              WHERE crawler_name = ?1 AND priority = ?2 AND status = ?3 \
-             ORDER BY rowid ASC LIMIT ?4",
+             ORDER BY error_count ASC, rowid ASC LIMIT ?4",
         )?;
         let rows = stmt
             .query_map(
@@ -746,6 +755,29 @@ impl Db {
                     login: row.get(0)?,
                     degree: row.get(1)?,
                     priority: "retry".to_string(),
+                    parent_login: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn queue_items_error(
+        &self,
+        crawler_name: &str,
+        limit: usize,
+    ) -> Result<Vec<QueueItem>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scope_key, degree FROM crawl_state \
+             WHERE crawler_name = ?1 AND status = 'error' \
+             ORDER BY rowid ASC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![crawler_name, limit as i64], |row| {
+                Ok(QueueItem {
+                    login: row.get(0)?,
+                    degree: row.get(1)?,
+                    priority: "error".to_string(),
                     parent_login: None,
                 })
             })?

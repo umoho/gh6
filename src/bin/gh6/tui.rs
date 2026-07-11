@@ -603,15 +603,17 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
         ])
         .split(area);
 
     let normal_title = format!(" {} normal ", display::num(status.pending_normal_count));
     let hub_title = format!(" {} hubs ", display::num(status.pending_hub_count));
     let retry_title = format!(" {} retries ", display::num(status.pending_retry_count));
+    let error_title = format!(" {} errors ", display::num(status.pending_errors_count));
 
     render_upcoming_block(
         f,
@@ -635,6 +637,14 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         &status.pending_retry,
         &retry_title,
         Style::new().red(),
+        Style::new().red().dim(),
+    );
+    render_upcoming_block(
+        f,
+        cols[3],
+        &status.pending_errors,
+        &error_title,
+        Style::new().red().dim(),
         Style::new().red().dim(),
     );
 }
