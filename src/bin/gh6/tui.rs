@@ -324,6 +324,20 @@ fn run_loop(
 fn render(f: &mut Frame, app: &App) {
     let area = f.area();
 
+    if app.status.is_none() {
+        let msg = Paragraph::new("connecting...".dim()).alignment(Alignment::Center);
+        let v_center = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ])
+            .split(area);
+        f.render_widget(msg, v_center[1]);
+        return;
+    }
+
     // Done: 2 (border) + 1 (header) + DONE_DATA_MAX (data) = 8
     const DONE_H: u16 = 8;
     let upcoming_h = if app.show_upcoming { 7u16 } else { 0u16 };
