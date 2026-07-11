@@ -314,8 +314,8 @@ fn render(f: &mut Frame, app: &App) {
     let area = f.area();
     let total_h = area.height as usize;
 
-    // Fixed regions: upcoming(6) + workers(1) + stats(1) = 8
-    let fixed = 8usize;
+    // Fixed regions: upcoming(7) + workers(1) + stats(1) = 9
+    let fixed = 9usize;
     let flex = total_h.saturating_sub(fixed);
 
     // Done gets at most DONE_MAX_ROWS (header + data), queue gets the rest.
@@ -328,7 +328,7 @@ fn render(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(done_h as u16),
             Constraint::Length(queue_h.max(1) as u16),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -361,7 +361,8 @@ fn shared_col_widths(app: &App) -> (usize, usize) {
         max_deg = max_deg.max(UnicodeWidthStr::width(deg_s.as_str()));
         max_login = max_login.max(UnicodeWidthStr::width(login));
     }
-    (max_deg, max_login)
+    // Cap login width so right columns don't overflow on narrow terminals.
+    (max_deg, max_login.min(30))
 }
 
 // ── Done panel ───────────────────────────────────────────────────────────
@@ -540,11 +541,11 @@ fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
         pad_right("LOGIN", login_w)
     );
     let left_w = 2 + deg_w + 2 + login_w;
-    let via_w = 3usize;
-    let right_w = via_w;
-    let gap = term_w.saturating_sub(left_w + right_w).max(1);
+    let via_label = "VIA";
+    let via_w = UnicodeWidthStr::width(via_label);
+    let gap = term_w.saturating_sub(left_w + via_w).max(1);
 
-    let line_str = format!("{left}{}VIA", " ".repeat(gap),);
+    let line_str = format!("{left}{}{via_label}", " ".repeat(gap));
     Line::from(line_str.dim().bold())
 }
 
@@ -560,8 +561,7 @@ fn format_queue_line(
     let login_s = pad_right(login, login_w);
     let left_w = 2 + deg_w + 2 + login_w;
 
-    let via_s = format!("via {parent_login}");
-    let via_w = UnicodeWidthStr::width(via_s.as_str());
+    let via_w = UnicodeWidthStr::width(parent_login);
     let gap = term_w.saturating_sub(left_w + via_w).max(1);
 
     Line::from(vec![
@@ -570,7 +570,7 @@ fn format_queue_line(
         Span::raw("  "),
         Span::styled(login_s, Style::new().blue()),
         Span::raw(" ".repeat(gap)),
-        Span::styled(via_s, Style::new().dim()),
+        Span::styled(parent_login.to_string(), Style::new().dim()),
     ])
 }
 
@@ -587,31 +587,41 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
         .split(area);
 
-    // Title row
-    let title = Line::from(vec![
-        "  Upcoming  ".dim(),
-        Span::styled(
-            format!("normal:{}", status.pending_normal_count),
-            Style::new().green(),
-        ),
-        "  ".dim(),
-        Span::styled(
-            format!("hub:{}", status.pending_hub_count),
-            Style::new().yellow(),
-        ),
-        "  ".dim(),
-        Span::styled(
-            format!("retry:{}", status.pending_retry_count),
-            Style::new().red(),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(title), chunks[0]);
+    // Row 0: title
+    f.render_widget(Paragraph::new("  Upcoming".dim()), chunks[0]);
 
-    // Three-column body: normal | hub | retry
-    let body_area = chunks[1];
+    // Row 1: column labels aligned with the three data columns
+    let hdr_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(chunks[1]);
+
+    f.render_widget(
+        Paragraph::new(format!("normal:{}", status.pending_normal_count).green()),
+        hdr_cols[0],
+    );
+    f.render_widget(
+        Paragraph::new(format!("hub:{}", status.pending_hub_count).yellow()),
+        hdr_cols[1],
+    );
+    f.render_widget(
+        Paragraph::new(format!("retry:{}", status.pending_retry_count).red()),
+        hdr_cols[2],
+    );
+
+    // Rows 2-6: data columns
+    let body_area = chunks[2];
     let col_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -621,12 +631,12 @@ fn render_upcoming(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(body_area);
 
-    render_upcoming_col(f, col_chunks[0], &status.pending_normal, "normal");
-    render_upcoming_col(f, col_chunks[1], &status.pending_hub, "hub");
-    render_upcoming_col(f, col_chunks[2], &status.pending_retry, "retry");
+    render_upcoming_col(f, col_chunks[0], &status.pending_normal);
+    render_upcoming_col(f, col_chunks[1], &status.pending_hub);
+    render_upcoming_col(f, col_chunks[2], &status.pending_retry);
 }
 
-fn render_upcoming_col(f: &mut Frame, area: Rect, items: &[QueueItem], _label: &str) {
+fn render_upcoming_col(f: &mut Frame, area: Rect, items: &[QueueItem]) {
     let visible = area.height as usize;
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(visible);
 
