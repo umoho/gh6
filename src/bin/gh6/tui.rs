@@ -21,7 +21,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Style, Stylize},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -34,9 +34,6 @@ use gh6::types::{CrawlEvent, QueueItem, ServerResponse, StatusData};
 const MAX_EVENTS: usize = 9999;
 /// Poll interval for keyboard input (milliseconds).
 const TICK_MS: u64 = 100;
-/// Maximum rows for the Done panel.
-const DONE_MAX_ROWS: usize = 15;
-
 // ── Focus ────────────────────────────────────────────────────────────────
 
 /// Which scrollable panel has keyboard focus.
@@ -63,6 +60,8 @@ pub struct App {
     queue_scroll: usize,
     /// Which panel receives keyboard input.
     focus: Panel,
+    /// Whether the Upcoming section is visible.
+    show_upcoming: bool,
     /// Set to true to signal the render loop to exit.
     quit: bool,
 }
@@ -76,6 +75,7 @@ impl App {
             done_scroll: 0,
             queue_scroll: 0,
             focus: Panel::Done,
+            show_upcoming: true,
             quit: false,
         }
     }
@@ -110,6 +110,10 @@ impl App {
                     Panel::Done => Panel::Queue,
                     Panel::Queue => Panel::Done,
                 };
+                false
+            }
+            KeyCode::Char('u') => {
+                self.show_upcoming = !self.show_upcoming;
                 false
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -312,34 +316,29 @@ fn run_loop(
 
 fn render(f: &mut Frame, app: &App) {
     let area = f.area();
-    let total_h = area.height as usize;
 
-    // Fixed regions: upcoming(7) + workers(1) + stats(1) = 9
-    let fixed = 9usize;
-    let flex = total_h.saturating_sub(fixed);
-
-    // Done gets at most DONE_MAX_ROWS (header + data), queue gets the rest.
-    let done_rows = (app.done_events.len() + 1).min(DONE_MAX_ROWS);
-    let done_h = done_rows.min(flex.saturating_sub(1));
-    let queue_h = flex.saturating_sub(done_h);
+    // Done: 2 (border) + 1 (header) + DONE_DATA_MAX (data) = 8
+    const DONE_H: u16 = 8;
+    let upcoming_h = if app.show_upcoming { 7u16 } else { 0u16 };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(done_h as u16),
-            Constraint::Length(queue_h.max(1) as u16),
-            Constraint::Length(7),
+            Constraint::Length(DONE_H),
+            Constraint::Min(3), // Queue (needs room for border + header + 1 data min)
+            Constraint::Length(upcoming_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
 
-    // Compute shared DEG / LOGIN column widths across both tables.
     let (deg_w, login_w) = shared_col_widths(app);
 
     render_done(f, layout[0], app, deg_w, login_w);
     render_queue(f, layout[1], app, deg_w, login_w);
-    render_upcoming(f, layout[2], app);
+    if app.show_upcoming {
+        render_upcoming(f, layout[2], app);
+    }
     render_workers(f, layout[3], app);
     render_stats(f, layout[4], app);
 }
@@ -368,18 +367,30 @@ fn shared_col_widths(app: &App) -> (usize, usize) {
 // ── Done panel ───────────────────────────────────────────────────────────
 
 fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usize) {
-    if area.height == 0 {
+    let border_style = if app.focus == Panel::Done {
+        Style::new().bold()
+    } else {
+        Style::new().dim()
+    };
+    let block = Block::bordered()
+        .title(" Done ")
+        .title_style(Style::new().dim())
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
         return;
     }
-    let term_w = area.width as usize;
+    let term_w = inner.width as usize;
 
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(inner.height as usize);
 
     // Header
     lines.push(done_header(deg_w, login_w, term_w));
 
-    // Data rows (bottom-aligned in the remaining space)
-    let data_h = area.height.saturating_sub(1) as usize;
+    // Data rows (bottom-aligned)
+    let data_h = inner.height.saturating_sub(1) as usize;
     let total = app.done_events.len();
     let end = total.saturating_sub(app.done_scroll);
     let start = end.saturating_sub(data_h);
@@ -410,14 +421,7 @@ fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usiz
         }
     }
 
-    // Focus indicator
-    let style = if app.focus == Panel::Done {
-        Style::new().bold()
-    } else {
-        Style::new()
-    };
-
-    f.render_widget(Paragraph::new(lines).style(style), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn done_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
@@ -494,18 +498,30 @@ fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
 // ── Queue panel ──────────────────────────────────────────────────────────
 
 fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usize) {
-    if area.height == 0 {
+    let border_style = if app.focus == Panel::Queue {
+        Style::new().bold()
+    } else {
+        Style::new().dim()
+    };
+    let block = Block::bordered()
+        .title(" Queue ")
+        .title_style(Style::new().dim())
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
         return;
     }
-    let term_w = area.width as usize;
+    let term_w = inner.width as usize;
 
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(inner.height as usize);
 
     // Header
     lines.push(queue_header(deg_w, login_w, term_w));
 
     // Data rows
-    let data_h = area.height.saturating_sub(1) as usize;
+    let data_h = inner.height.saturating_sub(1) as usize;
     let total = app.queue_events.len();
     let end = total.saturating_sub(app.queue_scroll);
     let start = end.saturating_sub(data_h);
@@ -532,13 +548,7 @@ fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usi
         }
     }
 
-    let style = if app.focus == Panel::Queue {
-        Style::new().bold()
-    } else {
-        Style::new()
-    };
-
-    f.render_widget(Paragraph::new(lines).style(style), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
