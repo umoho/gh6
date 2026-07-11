@@ -421,27 +421,33 @@ fn render_done(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usiz
 }
 
 fn done_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
-    let left = format!(
-        "  {}  {}",
-        pad_right("DEG", deg_w),
-        pad_right("LOGIN", login_w)
-    );
     let left_w = 2 + deg_w + 2 + login_w;
     let fw = 9usize;
-    let new_w = 3usize; // "NEW"
+    let new_w = 3usize;
     let right_w = fw + 2 + fw + 2 + new_w;
-    let gap = term_w.saturating_sub(left_w + right_w).max(1);
+    let gap = term_w.saturating_sub(left_w + right_w + 1).max(1);
 
-    let line_str = format!(
-        "{left}{}  {:>fw$}  {:>fw$}  {:>new_w$}",
-        " ".repeat(gap),
-        "FOLLOWING",
-        "FOLLOWERS",
-        "NEW",
-        fw = fw,
-        new_w = new_w,
-    );
-    Line::from(line_str.dim().bold())
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(pad_right("DEG", deg_w), Style::new().dim().bold()),
+        Span::raw("  "),
+        Span::styled(pad_right("LOGIN", login_w), Style::new().dim().bold()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            format!("{:>fw$}", "FOLLOWING", fw = fw),
+            Style::new().dim().bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:>fw$}", "FOLLOWERS", fw = fw),
+            Style::new().dim().bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:>new_w$}", "NEW", new_w = new_w),
+            Style::new().dim().bold(),
+        ),
+    ])
 }
 
 /// Layout parameters for formatting a done-line row.
@@ -468,7 +474,7 @@ fn format_done_line(cfg: &DoneFmt<'_>) -> Line<'static> {
     let fw = 9usize;
     let new_w = UnicodeWidthStr::width(new_s.as_str());
     let right_w = fw + 2 + fw + 2 + new_w;
-    let gap = cfg.term_w.saturating_sub(left_w + right_w).max(1);
+    let gap = cfg.term_w.saturating_sub(left_w + right_w + 1).max(1);
 
     Line::from(vec![
         Span::raw("  "),
@@ -535,18 +541,18 @@ fn render_queue(f: &mut Frame, area: Rect, app: &App, deg_w: usize, login_w: usi
 }
 
 fn queue_header(deg_w: usize, login_w: usize, term_w: usize) -> Line<'static> {
-    let left = format!(
-        "  {}  {}",
-        pad_right("DEG", deg_w),
-        pad_right("LOGIN", login_w)
-    );
     let left_w = 2 + deg_w + 2 + login_w;
-    let via_label = "VIA";
-    let via_w = UnicodeWidthStr::width(via_label);
-    let gap = term_w.saturating_sub(left_w + via_w).max(1);
+    let via_w = 3usize;
+    let gap = term_w.saturating_sub(left_w + via_w + 1).max(1);
 
-    let line_str = format!("{left}{}{via_label}", " ".repeat(gap));
-    Line::from(line_str.dim().bold())
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(pad_right("DEG", deg_w), Style::new().dim().bold()),
+        Span::raw("  "),
+        Span::styled(pad_right("LOGIN", login_w), Style::new().dim().bold()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled("VIA".to_string(), Style::new().dim().bold()),
+    ])
 }
 
 fn format_queue_line(
@@ -562,7 +568,7 @@ fn format_queue_line(
     let left_w = 2 + deg_w + 2 + login_w;
 
     let via_w = UnicodeWidthStr::width(parent_login);
-    let gap = term_w.saturating_sub(left_w + via_w).max(1);
+    let gap = term_w.saturating_sub(left_w + via_w + 1).max(1);
 
     Line::from(vec![
         Span::raw("  "),
